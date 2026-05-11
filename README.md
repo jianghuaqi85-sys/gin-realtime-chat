@@ -1,323 +1,328 @@
-# GIn -- Gin High Performance Chat Server
+# GIn -- 高性能 Gin 聊天服务器
 
-A high-performance real-time chat server built with Go and the Gin framework, featuring WebSocket-based messaging, multi-channel support, admin management panel, Redis Pub/Sub for horizontal scaling, Cloudflare Tunnel for instant public access, and a built-in single-page chat UI.
+基于 Go + Gin 框架的高性能实时聊天服务器，支持 WebSocket 消息推送、多频道聊天、管理面板、Redis Pub/Sub 水平扩展、Cloudflare Tunnel 一键公网穿透，内置单页聊天 UI。
 
 ---
 
-## Tech Stack
+## 技术栈
 
-| Layer | Technology |
+| 层级 | 技术 |
 |---|---|
-| Language | Go 1.25 |
-| HTTP Framework | Gin v1.10 |
-| Database | MySQL 8.x (via GORM v1.31) |
-| Cache / Message Bus | Redis (go-redis v8) |
+| 语言 | Go 1.25 |
+| HTTP 框架 | Gin v1.10 |
+| 数据库 | MySQL 8.x（GORM v1.31） |
+| 缓存 / 消息总线 | Redis（go-redis v8） |
 | WebSocket | Gorilla WebSocket v1.5 |
-| Authentication | JWT (golang-jwt v5) + bcrypt |
-| Configuration | Viper (`.env` file + environment variables) |
-| Logging | Logrus (structured JSON) |
-| Tracing | OpenTelemetry (OTLP HTTP / stdout) |
-| gRPC | google.golang.org/grpc v1.80 + Protobuf |
-| Compression | gin-contrib/gzip |
-| Rate Limiting | Redis sliding-window (Lua script) |
-| Tunnel | Cloudflare Tunnel (`cloudflared`) |
-| Frontend | Single-page HTML/CSS/JS (embedded in Go binary) |
+| 认证 | JWT（golang-jwt v5）+ bcrypt |
+| 配置管理 | Viper（`.env` 文件 + 环境变量） |
+| 日志 | Logrus（结构化 JSON） |
+| 链路追踪 | OpenTelemetry（OTLP HTTP / stdout） |
+| RPC | gRPC v1.80 + Protobuf |
+| 压缩 | gin-contrib/gzip |
+| 限流 | Redis 滑动窗口（Lua 脚本） |
+| 公网穿透 | Cloudflare Tunnel（`cloudflared`） |
+| 前端 | 单页 HTML/CSS/JS（内嵌在 Go 二进制中） |
 
 ---
 
-## Features
+## 功能特性
 
-### Core Chat
+### 核心聊天
 
-- User registration and login with bcrypt password hashing
-- JWT-based authentication (HS256, configurable expiry)
-- Multi-channel chat: create, list, and switch between channels
-- Real-time messaging via WebSocket with automatic reconnection
-- Message editing and deletion (own messages only)
-- Message history with cursor-based pagination (`before` timestamp)
-- System messages for user join/leave events
-- Online user list with periodic refresh
-- Password change (requires old password verification)
-- Session persistence via localStorage (auto-login on reload)
+- 用户注册与登录（bcrypt 密码哈希）
+- JWT 认证（HS256，可配置过期时间）
+- 多频道聊天：创建、列出、切换频道
+- WebSocket 实时消息推送，支持自动重连
+- 消息编辑与删除（仅限自己的消息）
+- 消息历史分页加载（基于时间戳游标）
+- 用户加入/离开频道的系统消息
+- 在线用户列表（定时刷新）
+- 修改密码（需验证旧密码）
+- 会话持久化（localStorage 自动登录）
 
-### Admin Panel
+### 管理面板
 
-- Server statistics dashboard (online users, total users, channels, messages)
-- User management: list, delete, ban, unban
-- Channel management: list, delete, clear messages
-- Global broadcast announcements to all connected users
-- Admin-only route protection with role-based middleware
+- 服务器统计面板（在线人数、注册用户、频道数、消息数）
+- 用户管理：列表、删除、封禁、解封
+- 频道管理：列表、删除、清空消息
+- 全局广播公告
+- 管理员路由权限保护（基于角色的中间件）
 
-### Real-Time Infrastructure
+### 实时基础设施
 
-- WebSocket Hub with 256 hash-bucketed client pools for lock contention reduction
-- 64-shard channel locks for fine-grained concurrency
-- Write-behind message persistence: broadcast first, async persist to DB
-- Redis Pub/Sub message bus for horizontal multi-instance scaling
-- Graceful shutdown with client notification before disconnect
-- Exponential backoff reconnection with fallback to HTTP polling (client-side)
-- Origin checking for WebSocket upgrade requests
+- WebSocket Hub 256 分桶架构，降低锁竞争
+- 64 分片频道锁，细粒度并发控制
+- Write-behind 消息持久化：先广播再异步写库
+- Redis Pub/Sub 消息总线，支持多实例水平扩展
+- 优雅关闭：断开前通知所有客户端
+- 指数退避重连 + HTTP 轮询降级（客户端侧）
+- WebSocket 升级请求的 Origin 校验
 
-### Performance Optimizations
+### 性能优化
 
-- Gzip compression middleware on all HTTP responses
-- Connection pool tuning: 50 idle, 200 max open, 1h lifetime
-- Sliding-window rate limiter via atomic Redis Lua script
-- sync.Pool for logging field maps to reduce GC pressure
-- Persistent worker pool (NumCPU goroutines) for async DB writes
-- FNV-32a hash-based sharding for both client buckets and channel locks
-- Read/write deadline management on WebSocket connections
+- Gzip 压缩中间件
+- 数据库连接池调优：50 空闲 / 200 最大 / 1 小时生命周期
+- Redis Lua 脚本原子化滑动窗口限流
+- sync.Pool 复用日志字段 Map，减少 GC 压力
+- 持久化 Worker 池（CPU 核数个 goroutine）异步写库
+- FNV-32a 哈希分桶（客户端桶 + 频道锁）
+- WebSocket 读写截止时间管理
 
-### Observability
+### 可观测性
 
-- OpenTelemetry distributed tracing (OTLP HTTP export or stdout)
-- Structured JSON logging via Logrus with request metadata
-- Health check endpoint (`/api/public/health`)
+- OpenTelemetry 分布式链路追踪（OTLP HTTP 导出或 stdout）
+- Logrus 结构化 JSON 日志（含请求元数据）
+- 健康检查端点（`/api/public/health`）
 
-### Deployment
+### 部署
 
-- Cloudflare Tunnel integration (auto-start, URL capture, public access)
-- ngrok tunnel URL detection via local API
-- One-click `start.bat` for Windows (Redis + API + Tunnel)
-- Built-in hot-reload development tool
-- Built-in benchmark tool for load testing
+- Cloudflare Tunnel 集成（自动启动、URL 捕获、公网访问）
+- ngrok 隧道 URL 自动检测（本地 API）
+- Windows 一键启动脚本 `start.bat`（Redis + API + Tunnel）
+- 内置热重载开发工具
+- 内置 HTTP 压测工具
 
 ---
 
-## Project Structure
+## 项目结构
 
 ```
 GIn/
 ├── cmd/
 │   ├── api/
-│   │   ├── main.go            # API server entry point, routing, graceful shutdown
-│   │   └── chat_html.go       # Embedded single-page chat UI (HTML/CSS/JS)
+│   │   ├── main.go            # API 服务器入口、路由注册、优雅关闭
+│   │   └── chat_html.go       # 内嵌单页聊天 UI（HTML/CSS/JS）
 │   ├── grpc/
-│   │   └── server.go          # Standalone gRPC server (Greeter service + health)
+│   │   └── server.go          # 独立 gRPC 服务器（Greeter 服务 + 健康检查）
 │   └── ws/
-│       └── server.go          # Standalone WebSocket server
+│       └── server.go          # 独立 WebSocket 服务器
 ├── internal/
 │   ├── config/
-│   │   └── config.go          # Viper-based configuration loader with validation
+│   │   └── config.go          # Viper 配置加载器（含校验）
 │   ├── database/
-│   │   └── database.go        # GORM MySQL connection with pool tuning
+│   │   └── database.go        # GORM MySQL 连接（连接池调优）
 │   ├── handler/
-│   │   ├── auth_handler.go    # Login, register, me, change password
-│   │   ├── chat_handler.go    # Channels, messages, WS message handler
-│   │   └── admin_handler.go   # Admin stats, user/channel/message management, broadcast
+│   │   ├── auth_handler.go    # 登录、注册、获取当前用户、修改密码
+│   │   ├── chat_handler.go    # 频道、消息、WebSocket 消息处理
+│   │   └── admin_handler.go   # 管理统计、用户/频道/消息管理、广播
 │   ├── logger/
-│   │   └── logger.go          # Logrus initialization and convenience wrappers
+│   │   └── logger.go          # Logrus 初始化与便捷封装
 │   ├── middleware/
-│   │   ├── auth.go            # JWT Bearer token authentication
-│   │   ├── admin.go           # Admin role verification (with DB fallback)
-│   │   ├── rate_limit.go      # Redis sliding-window rate limiter middleware
-│   │   ├── logging.go         # Request logging with sync.Pool optimization
-│   │   └── otel.go            # OpenTelemetry span creation middleware
+│   │   ├── auth.go            # JWT Bearer Token 认证中间件
+│   │   ├── admin.go           # 管理员角色校验（兼容旧 Token 回退查库）
+│   │   ├── rate_limit.go      # Redis 滑动窗口限流中间件
+│   │   ├── logging.go         # 请求日志中间件（sync.Pool 优化）
+│   │   └── otel.go            # OpenTelemetry Span 创建中间件
 │   ├── repository/
-│   │   ├── user_repository.go # User model + InMemory / MySQL implementations
-│   │   └── chat_repository.go # Channel + Message models + MySQL implementations
+│   │   ├── user_repository.go # 用户模型 + 内存/MySQL 双实现
+│   │   └── chat_repository.go # 频道 + 消息模型 + MySQL 实现
 │   ├── service/
-│   │   └── greeter.go         # gRPC Greeter service implementation
+│   │   └── greeter.go         # gRPC Greeter 服务实现
 │   └── tunnel/
-│       └── tunnel.go          # Cloudflare Tunnel process manager
+│       └── tunnel.go          # Cloudflare Tunnel 进程管理器
 ├── pkg/
 │   ├── jwt/
-│   │   └── jwt.go             # JWT generation, parsing, validation (HS256)
+│   │   └── jwt.go             # JWT 生成、解析、验证（HS256）
 │   ├── limiter/
-│   │   └── limiter.go         # Redis Lua sliding-window rate limiter
+│   │   └── limiter.go         # Redis Lua 滑动窗口限流器
 │   ├── otel/
-│   │   └── otel.go            # OpenTelemetry tracer provider initialization
+│   │   └── otel.go            # OpenTelemetry Tracer Provider 初始化
 │   ├── redisbus/
-│   │   └── bus.go             # Redis Pub/Sub message bus for cross-instance broadcast
+│   │   └── bus.go             # Redis Pub/Sub 跨实例消息总线
 │   └── ws/
-│       └── ws.go              # WebSocket Hub, Bucket, Client, channel sharding
+│       └── ws.go              # WebSocket Hub、Bucket、Client、频道分片
 ├── proto/
-│   └── service.proto          # Protobuf definition for Greeter service
+│   └── service.proto          # Greeter 服务 Protobuf 定义
 ├── tools/
 │   ├── benchmark/
-│   │   └── benchmark.go       # HTTP load testing tool (QPS, latency, P99)
+│   │   └── benchmark.go       # HTTP 压测工具（QPS、延迟、P99）
 │   └── hotreload/
-│       └── hotreload.go       # File watcher for automatic server restart
-├── .env                       # Environment configuration (not committed)
-├── go.mod                     # Go module definition
-├── go.sum                     # Dependency checksums
-├── Makefile                   # Build, run, test, proto generation commands
-└── start.bat                  # Windows one-click startup (Redis + API + Tunnel)
+│       └── hotreload.go       # 文件监听自动重启工具
+├── .env.example               # 环境配置模板
+├── .gitignore                 # Git 忽略规则
+├── go.mod                     # Go 模块定义
+├── go.sum                     # 依赖校验和
+├── Makefile                   # 构建、运行、测试命令
+└── start.bat                  # Windows 一键启动脚本（Redis + API + Tunnel）
 ```
 
 ---
 
-## Quick Start
+## 快速开始
 
-### Prerequisites
+### 环境要求
 
 - Go 1.25+
 - Redis 6.x+
-- MySQL 8.x+ (optional; without it, only in-memory user storage is available, chat features are disabled)
-- `cloudflared` CLI (optional, for public tunnel)
+- MySQL 8.x+（可选；不配置则使用内存存储，聊天功能不可用）
+- `cloudflared` CLI（可选，用于公网穿透）
 
-### 1. Clone and Configure
+### 1. 克隆并配置
 
 ```bash
-git clone https://github.com/example/gin-high-performance.git
-cd gin-high-performance
-cp .env.example .env   # or create .env manually
+git clone https://github.com/your-username/GIn.git
+cd GIn
+cp .env.example .env
 ```
 
-Edit `.env` with your settings (minimum required: `JWT_SECRET` with at least 32 characters).
+编辑 `.env` 文件（至少需要设置 `JWT_SECRET`，长度不少于 32 个字符）。
 
-### 2. Install Dependencies
+### 2. 安装依赖
 
 ```bash
 go mod download
 ```
 
-### 3. Run
+### 3. 启动
 
-**Option A: Make**
-
-```bash
-make run          # Run API server directly
-make build        # Build all binaries to bin/
-make start        # Run start.bat (Windows)
-```
-
-**Option B: Go directly**
+**方式一：Make 命令**
 
 ```bash
-go run ./cmd/api/main.go
+make run          # 直接运行 API 服务器
+make build        # 编译所有二进制到 bin/ 目录
+make start        # 运行 start.bat（Windows）
 ```
 
-**Option C: Windows one-click**
+**方式二：Go 直接运行**
 
-Double-click `start.bat` -- it automatically starts Redis, the API server, and Cloudflare Tunnel.
+```bash
+go run ./cmd/api/
+```
 
-### 4. Access
+**方式三：Windows 一键启动**
 
-- Local: `http://localhost:8080`
-- Public: check the Cloudflare Tunnel window or the tunnel URL in the UI sidebar
+双击 `start.bat`，自动完成：
+1. 启动 Redis（如果未运行）
+2. 启动 API 服务器
+3. 启动 Cloudflare Tunnel
+4. 显示本地和公网访问地址
 
-### 5. Default Admin Account
+### 4. 访问
 
-| Field | Value |
+- 本地：`http://localhost:8080`
+- 公网：查看 Cloudflare Tunnel 窗口或 UI 侧边栏中的隧道地址
+
+### 5. 默认管理员账号
+
+| 字段 | 值 |
 |---|---|
-| Username | `admin` |
-| Password | `admin123` |
+| 用户名 | `admin` |
+| 密码 | `admin123` |
 
-Change this password immediately after first login.
+首次登录后请立即修改密码。
 
 ---
 
-## API Documentation
+## API 文档
 
-Base URL: `http://localhost:8080`
+基础 URL：`http://localhost:8080`
 
-All authenticated endpoints require the `Authorization: Bearer <token>` header.
+所有需要认证的接口必须在请求头中携带 `Authorization: Bearer <token>`。
 
-### Public Endpoints (no auth required)
+### 公开接口（无需认证）
 
-| Method | Path | Description | Rate Limit |
+| 方法 | 路径 | 说明 | 限流 |
 |---|---|---|---|
-| `POST` | `/api/public/register` | Register a new user | 20/min per IP |
-| `POST` | `/api/public/login` | Login, returns JWT token | 20/min per IP |
-| `GET` | `/api/public/health` | Health check | 20/min per IP |
+| `POST` | `/api/public/register` | 用户注册 | 20次/分钟/IP |
+| `POST` | `/api/public/login` | 用户登录，返回 JWT Token | 20次/分钟/IP |
+| `GET` | `/api/public/health` | 健康检查 | 20次/分钟/IP |
 
 #### POST /api/public/register
 
 ```json
-// Request
+// 请求
 { "username": "alice", "password": "secret123", "confirm_password": "secret123" }
 
-// Success 201
+// 成功 201
 { "message": "user created" }
 
-// Error 409
+// 错误 409
 { "error": "用户名已被占用" }
 ```
 
-Validation rules:
-- Username: 3-32 characters, alphanumeric + underscore only
-- Password: minimum 8 characters
-- Confirm password must match
+校验规则：
+- 用户名：3-32 个字符，仅允许字母、数字、下划线
+- 密码：至少 8 个字符
+- 确认密码必须一致
 
 #### POST /api/public/login
 
 ```json
-// Request
+// 请求
 { "username": "alice", "password": "secret123" }
 
-// Success 200
+// 成功 200
 { "token": "eyJhbGciOiJIUzI1NiIs..." }
 
-// Error 401
+// 错误 401
 { "error": "用户名或密码错误" }
 ```
 
 #### GET /api/public/health
 
 ```json
-// Success 200
+// 成功 200
 { "status": "ok", "timestamp": 1715000000 }
 ```
 
-### Authenticated Endpoints
+### 认证接口
 
-| Method | Path | Description |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/api/me` | Get current user info |
-| `PUT` | `/api/password` | Change password |
-| `GET` | `/api/channels` | List all channels |
-| `POST` | `/api/channels` | Create a new channel |
-| `GET` | `/api/channels/:id/messages` | Get channel messages (paginated) |
-| `PUT` | `/api/messages/:id` | Edit own message |
-| `DELETE` | `/api/messages/:id` | Delete own message |
-| `GET` | `/api/online` | List online users |
-| `GET` | `/api/tunnel` | Get public tunnel URLs |
+| `GET` | `/api/me` | 获取当前用户信息 |
+| `PUT` | `/api/password` | 修改密码 |
+| `GET` | `/api/channels` | 获取频道列表 |
+| `POST` | `/api/channels` | 创建频道 |
+| `GET` | `/api/channels/:id/messages` | 获取频道消息（分页） |
+| `PUT` | `/api/messages/:id` | 编辑自己的消息 |
+| `DELETE` | `/api/messages/:id` | 删除自己的消息 |
+| `GET` | `/api/online` | 获取在线用户列表 |
+| `GET` | `/api/tunnel` | 获取公网隧道地址 |
 
-Rate limit for authenticated endpoints: 100 requests/minute per IP.
+认证接口限流：100 次/分钟/IP。
 
 #### GET /api/me
 
 ```json
-// Success 200
+// 成功 200
 { "user_id": "uuid...", "username": "alice" }
 ```
 
 #### PUT /api/password
 
 ```json
-// Request
+// 请求
 { "old_password": "secret123", "new_password": "newsecret456" }
 
-// Success 200
+// 成功 200
 { "message": "密码修改成功" }
 ```
 
 #### POST /api/channels
 
 ```json
-// Request
+// 请求
 { "name": "general" }
 
-// Success 201
+// 成功 201
 { "ID": "uuid...", "Name": "general", "CreatedBy": "uuid...", "CreatedAt": "..." }
 ```
 
 #### GET /api/channels/:id/messages
 
-Query parameters:
-- `limit` (default: 50, max: 200) -- number of messages
-- `before` (optional, RFC3339 timestamp) -- cursor for pagination
+查询参数：
+- `limit`（默认：50，最大：200）— 返回消息数量
+- `before`（可选，RFC3339 时间戳）— 分页游标
 
 ```json
-// Success 200
+// 成功 200
 [
   {
     "ID": "uuid...",
     "ChannelID": "uuid...",
     "UserID": "uuid...",
     "Username": "alice",
-    "Content": "Hello!",
+    "Content": "你好！",
     "CreatedAt": "2026-05-12T10:00:00Z"
   }
 ]
@@ -326,48 +331,48 @@ Query parameters:
 #### PUT /api/messages/:id
 
 ```json
-// Request
-{ "content": "Updated message text" }
+// 请求
+{ "content": "修改后的消息内容" }
 
-// Success 200
+// 成功 200
 { "message": "编辑成功" }
 ```
 
 #### DELETE /api/messages/:id
 
 ```json
-// Success 200
+// 成功 200
 { "message": "删除成功" }
 
-// Error 403
+// 错误 403
 { "error": "只能删除自己的消息" }
 ```
 
 #### GET /api/tunnel
 
 ```json
-// Success 200
+// 成功 200
 { "urls": ["https://random-name.trycloudflare.com"] }
 
-// Error 404
+// 错误 404
 { "error": "没有检测到隧道，请确认 ngrok 或 Cloudflare Tunnel 已启动" }
 ```
 
-### Admin Endpoints
+### 管理员接口
 
-All admin endpoints require authentication + admin role.
+所有管理员接口需要认证 + 管理员角色。
 
-| Method | Path | Description |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/api/admin/stats` | Server statistics |
-| `GET` | `/api/admin/users` | List all users |
-| `DELETE` | `/api/admin/users/:id` | Delete a user (disconnects first) |
-| `POST` | `/api/admin/ban` | Ban a user |
-| `POST` | `/api/admin/unban` | Unban a user |
-| `DELETE` | `/api/admin/channels/:id` | Delete channel and its messages |
-| `DELETE` | `/api/admin/channels/:id/messages` | Clear all messages in a channel |
-| `DELETE` | `/api/admin/messages/:id` | Delete any message |
-| `POST` | `/api/admin/broadcast` | Send system announcement to all users |
+| `GET` | `/api/admin/stats` | 服务器统计 |
+| `GET` | `/api/admin/users` | 用户列表 |
+| `DELETE` | `/api/admin/users/:id` | 删除用户（先断开连接） |
+| `POST` | `/api/admin/ban` | 封禁用户 |
+| `POST` | `/api/admin/unban` | 解封用户 |
+| `DELETE` | `/api/admin/channels/:id` | 删除频道及其消息 |
+| `DELETE` | `/api/admin/channels/:id/messages` | 清空频道消息 |
+| `DELETE` | `/api/admin/messages/:id` | 删除任意消息 |
+| `POST` | `/api/admin/broadcast` | 向所有用户发送系统公告 |
 
 #### GET /api/admin/stats
 
@@ -392,125 +397,125 @@ All admin endpoints require authentication + admin role.
 #### POST /api/admin/ban
 
 ```json
-// Request
+// 请求
 { "user_id": "uuid..." }
 
-// Success 200
+// 成功 200
 { "banned": "uuid..." }
 ```
 
 #### POST /api/admin/unban
 
 ```json
-// Request
+// 请求
 { "user_id": "uuid..." }
 
-// Success 200
+// 成功 200
 { "unbanned": "uuid..." }
 ```
 
 #### POST /api/admin/broadcast
 
 ```json
-// Request
+// 请求
 { "content": "系统维护通知：今晚 22:00 将进行升级" }
 
-// Success 200
+// 成功 200
 { "broadcast": "系统维护通知：今晚 22:00 将进行升级" }
 ```
 
 ---
 
-## WebSocket Protocol
+## WebSocket 协议
 
-Endpoint: `ws://localhost:8080/api/ws` (or `wss://` over TLS)
+端点：`ws://localhost:8080/api/ws`（或通过 TLS 使用 `wss://`）
 
-### Connection Flow
+### 连接流程
 
 ```
-Client                          Server
-  |                               |
-  |--- WS Upgrade Request ------->|
-  |<-- 101 Switching Protocols ---|
-  |                               |
-  |--- { type: "auth", token } -->|   (must be first message, 10s timeout)
-  |<-- { type: "auth_ok" } -------|
-  |                               |
-  |--- { type: "join", channel_id } -->|
-  |<-- { type: "system", content: "alice joined" } --|
-  |                               |
-  |--- { type: "message", channel_id, content } -->|
-  |<-- { type: "message", ... } --|  (broadcast to all channel members)
-  |                               |
-  |--- { type: "leave", channel_id } -->|
-  |<-- { type: "system", content: "alice left" } --|
+客户端                              服务器
+  |                                   |
+  |--- WebSocket 升级请求 ------------>|
+  |<-- 101 切换协议 -------------------|
+  |                                   |
+  |--- { type: "auth", token } ------>|   （必须是第一条消息，10 秒超时）
+  |<-- { type: "auth_ok" } -----------|
+  |                                   |
+  |--- { type: "join", channel_id } ->|
+  |<-- { type: "system", content: "alice 加入了频道" } --|
+  |                                   |
+  |--- { type: "message", channel_id, content } ->|
+  |<-- { type: "message", ... } ------|  （广播给频道内所有成员）
+  |                                   |
+  |--- { type: "leave", channel_id }->|
+  |<-- { type: "system", content: "alice 离开了频道" } --|
 ```
 
-### Message Types
+### 消息类型
 
-#### Client -> Server
+#### 客户端 -> 服务器
 
-| type | Fields | Description |
+| type | 字段 | 说明 |
 |---|---|---|
-| `auth` | `token` | Authenticate with JWT. Must be first message. |
-| `join` | `channel_id` | Join a channel to receive its messages |
-| `leave` | `channel_id` | Leave a channel |
-| `message` | `channel_id`, `content` | Send a message to a joined channel |
+| `auth` | `token` | JWT 认证，必须是第一条消息 |
+| `join` | `channel_id` | 加入频道以接收消息 |
+| `leave` | `channel_id` | 离开频道 |
+| `message` | `channel_id`, `content` | 向已加入的频道发送消息 |
 
-#### Server -> Client
+#### 服务器 -> 客户端
 
-| type | Fields | Description |
+| type | 字段 | 说明 |
 |---|---|---|
-| `auth_ok` | `content` (username) | Authentication successful |
-| `error` | `content` | Error message (auth failure, not in channel, etc.) |
-| `message` | `channel_id`, `user_id`, `username`, `content`, `created_at` | New message in a channel |
-| `system` | `channel_id` (optional), `content`, `created_at` | System notification (join/leave/broadcast) |
+| `auth_ok` | `content`（用户名） | 认证成功 |
+| `error` | `content` | 错误消息（认证失败、未加入频道等） |
+| `message` | `channel_id`, `user_id`, `username`, `content`, `created_at` | 频道新消息 |
+| `system` | `channel_id`（可选）, `content`, `created_at` | 系统通知（加入/离开/广播） |
 
-### Connection Parameters
+### 连接参数
 
-| Parameter | Value |
+| 参数 | 值 |
 |---|---|
-| Ping interval | 54 seconds |
-| Pong timeout | 60 seconds |
-| Write deadline | 10 seconds |
-| Auth timeout | 10 seconds |
-| Default read limit | 512 bytes (configurable via `WS_READ_LIMIT`) |
-| Send buffer per client | 256 messages |
+| Ping 间隔 | 54 秒 |
+| Pong 超时 | 60 秒 |
+| 写入截止时间 | 10 秒 |
+| 认证超时 | 10 秒 |
+| 默认读取限制 | 512 字节（可通过 `WS_READ_LIMIT` 配置） |
+| 每客户端发送缓冲 | 256 条消息 |
 
-### Client-Side Reconnection Strategy
+### 客户端重连策略
 
-The built-in UI implements:
-1. Exponential backoff: 1s -> 2s -> 4s -> 8s -> 16s -> 30s (cap)
-2. After 5 consecutive failures, falls back to HTTP polling (every 5 seconds)
-3. Automatically resumes WebSocket when connection is restored
+内置 UI 实现了：
+1. 指数退避：1s → 2s → 4s → 8s → 16s → 30s（上限）
+2. 连续 5 次失败后降级为 HTTP 轮询（每 5 秒一次）
+3. WebSocket 恢复后自动切回
 
 ---
 
-## Configuration
+## 配置说明
 
-All configuration is loaded from `.env` file and/or environment variables. Environment variables take precedence.
+所有配置从 `.env` 文件和/或环境变量加载，环境变量优先。
 
-| Variable | Type | Default | Description |
+| 变量 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `APP_ENV` | string | `development` | Application environment (`development` / `production`) |
-| `APP_PORT` | string | `8080` | HTTP API server port |
-| `GRPC_PORT` | string | `9090` | gRPC server port (standalone mode) |
-| `WS_PORT` | string | `8081` | WebSocket server port (standalone mode) |
-| `JWT_SECRET` | string | **(required)** | Secret key for JWT signing. Must be at least 32 characters. |
-| `JWT_EXPIRE_HOURS` | int | `24` | JWT token expiration time in hours |
-| `REDIS_ADDR` | string | `localhost:6379` | Redis server address |
-| `REDIS_PASSWORD` | string | *(empty)* | Redis authentication password |
-| `REDIS_DB` | int | `0` | Redis database number |
-| `MYSQL_DSN` | string | *(empty)* | MySQL connection string. If empty, uses in-memory storage and disables chat features. |
-| `OTEL_ENDPOINT` | string | *(empty)* | OpenTelemetry collector endpoint. Set to `stdout` or leave empty for console output. |
-| `OTEL_INSECURE` | bool | `true` | Allow insecure OTLP HTTP connection |
-| `LOG_LEVEL` | string | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
-| `DB_LOG_LEVEL` | string | `warn` | GORM SQL log level: `silent`, `error`, `warn`, `info` |
-| `WS_ALLOWED_ORIGIN` | string | *(empty)* | Allowed WebSocket origin. If empty, only same-origin connections are allowed. |
-| `WS_READ_LIMIT` | int | `512` | Maximum WebSocket message size in bytes |
-| `CLOUDFLARED_PATH` | string | *(empty)* | Path to `cloudflared` executable. If set, auto-starts Cloudflare Tunnel on boot. |
+| `APP_ENV` | string | `development` | 应用环境（`development` / `production`） |
+| `APP_PORT` | string | `8080` | HTTP API 服务器端口 |
+| `GRPC_PORT` | string | `9090` | gRPC 服务器端口（独立模式） |
+| `WS_PORT` | string | `8081` | WebSocket 服务器端口（独立模式） |
+| `JWT_SECRET` | string | **（必填）** | JWT 签名密钥，至少 32 个字符 |
+| `JWT_EXPIRE_HOURS` | int | `24` | JWT Token 过期时间（小时） |
+| `REDIS_ADDR` | string | `localhost:6379` | Redis 服务器地址 |
+| `REDIS_PASSWORD` | string | *(空)* | Redis 认证密码 |
+| `REDIS_DB` | int | `0` | Redis 数据库编号 |
+| `MYSQL_DSN` | string | *(空)* | MySQL 连接字符串。留空则使用内存存储，聊天功能不可用 |
+| `OTEL_ENDPOINT` | string | *(空)* | OpenTelemetry 采集器端点。设为 `stdout` 或留空输出到控制台 |
+| `OTEL_INSECURE` | bool | `true` | 允许不安全的 OTLP HTTP 连接 |
+| `LOG_LEVEL` | string | `info` | 日志级别：`trace`, `debug`, `info`, `warn`, `error`, `fatal` |
+| `DB_LOG_LEVEL` | string | `warn` | GORM SQL 日志级别：`silent`, `error`, `warn`, `info` |
+| `WS_ALLOWED_ORIGIN` | string | *(空)* | 允许的 WebSocket Origin。留空则只允许同源连接 |
+| `WS_READ_LIMIT` | int | `512` | WebSocket 消息最大字节数 |
+| `CLOUDFLARED_PATH` | string | *(空)* | `cloudflared` 可执行文件路径。设置后启动时自动开启 Cloudflare Tunnel |
 
-### MySQL DSN Format
+### MySQL DSN 格式
 
 ```
 user:password@tcp(host:port)/dbname?charset=utf8mb4&collation=utf8mb4_unicode_ci&parseTime=True&loc=Local
@@ -518,34 +523,34 @@ user:password@tcp(host:port)/dbname?charset=utf8mb4&collation=utf8mb4_unicode_ci
 
 ---
 
-## Deployment
+## 部署说明
 
-### Local Development
+### 本地开发
 
 ```bash
-# Terminal 1: Start Redis
+# 终端 1：启动 Redis
 redis-server
 
-# Terminal 2: Start API server
+# 终端 2：启动 API 服务器
 make run
 
-# Or use hot-reload during development
+# 或使用热重载开发
 make hotreload
 ```
 
-### Build for Production
+### 生产环境构建
 
 ```bash
 make build
-# Outputs:
-#   bin/api   - HTTP API + WebSocket + embedded UI
-#   bin/grpc  - Standalone gRPC server
-#   bin/ws    - Standalone WebSocket server
+# 输出：
+#   bin/api   - HTTP API + WebSocket + 内嵌 UI
+#   bin/grpc  - 独立 gRPC 服务器
+#   bin/ws    - 独立 WebSocket 服务器
 ```
 
-### Docker Compose (MySQL + Redis)
+### Docker Compose（MySQL + Redis）
 
-Create a `docker-compose.yml` for dependencies:
+创建 `docker-compose.yml` 管理依赖：
 
 ```yaml
 services:
@@ -565,29 +570,29 @@ services:
 
 ### Cloudflare Tunnel
 
-**Automatic (via configuration):**
+**自动模式（推荐）：**
 
-Set `CLOUDFLARED_PATH` in `.env` to the path of your `cloudflared` executable. The server will automatically start a tunnel on boot and capture the public URL.
+在 `.env` 中设置 `CLOUDFLARED_PATH` 指向 `cloudflared` 可执行文件路径。服务器启动时会自动开启隧道并捕获公网地址。
 
 ```env
 CLOUDFLARED_PATH=/usr/local/bin/cloudflared
 ```
 
-**Manual:**
+**手动模式：**
 
 ```bash
 cloudflared tunnel --url http://localhost:8080
 ```
 
-The tunnel URL is displayed in the server logs and in the chat UI sidebar. The URL is also saved to `.tunnel_url` for API access.
+隧道地址会显示在服务器日志和聊天 UI 侧边栏中，同时保存到 `.tunnel_url` 文件供 API 读取。
 
-**ngrok (alternative):**
+**ngrok（替代方案）：**
 
-If ngrok is running on the default port (4040), the server automatically detects the tunnel URL via the ngrok local API.
+如果 ngrok 在默认端口（4040）运行，服务器会自动通过 ngrok 本地 API 检测隧道地址。
 
-### Windows One-Click Start
+### Windows 一键启动
 
-Edit `start.bat` to configure paths:
+编辑 `start.bat` 配置路径：
 
 ```bat
 set CLOUDFLARED=D:\cloudflared.exe
@@ -595,154 +600,154 @@ set REDIS_SERVER=D:\Redis\redis-server.exe
 set REDIS_CONFIG=D:\Redis\redis.windows.conf
 ```
 
-Then double-click `start.bat`. It will:
-1. Start Redis (if not already running)
-2. Start the API server
-3. Start Cloudflare Tunnel
-4. Display local and public access URLs
+双击 `start.bat`，自动完成：
+1. 启动 Redis（如果未运行）
+2. 启动 API 服务器
+3. 启动 Cloudflare Tunnel
+4. 显示本地和公网访问地址
 
 ---
 
-## Architecture
+## 架构说明
 
-### Request Flow
+### 请求流程
 
 ```
-Client Request
+客户端请求
     |
     v
-[Gin Router]
+[Gin 路由器]
     |
-    +-- Recovery Middleware (panic recovery)
-    +-- Gzip Middleware (response compression)
-    +-- OTel Middleware (distributed tracing)
-    +-- Logging Middleware (structured request logging)
+    +-- Recovery 中间件（panic 恢复）
+    +-- Gzip 中间件（响应压缩）
+    +-- OTel 中间件（分布式链路追踪）
+    +-- Logging 中间件（结构化请求日志）
     |
-    +-- /api/public/*  --> Rate Limiter (20/min) --> Auth Handler
-    +-- /api/*         --> Rate Limiter (100/min) --> Auth Middleware --> Handlers
-    +-- /api/admin/*   --> Rate Limiter (100/min) --> Auth Middleware --> Admin Middleware --> Admin Handlers
-    +-- /api/ws        --> WebSocket Upgrade --> Auth (first message) --> Hub
+    +-- /api/public/*  --> 限流中间件（20次/分钟） --> 认证处理器
+    +-- /api/*         --> 限流中间件（100次/分钟） --> 认证中间件 --> 业务处理器
+    +-- /api/admin/*   --> 限流中间件（100次/分钟） --> 认证中间件 --> 管理员中间件 --> 管理处理器
+    +-- /api/ws        --> WebSocket 升级 --> 认证（第一条消息） --> Hub
 ```
 
-### WebSocket Architecture
+### WebSocket 架构
 
 ```
                     +------------------+
                     |     Hub          |
-                    |  (256 buckets)   |
+                    |  （256 个桶）     |
                     +--------+---------+
                              |
             +----------------+----------------+
             |                |                |
      +------+------+  +-----+------+  +------+------+
-     |  Bucket 0   |  |  Bucket 1  |  | Bucket 255  |
-     | (goroutine) |  | (goroutine)|  | (goroutine) |
+     |   桶 0      |  |   桶 1      |  |  桶 255     |
+     | (goroutine) |  | (goroutine) |  | (goroutine) |
      +------+------+  +-----+------+  +------+------+
             |                |                |
        +----+----+      +----+----+      +----+----+
-       | Client  |      | Client  |      | Client  |
-       | Client  |      | Client  |      | Client  |
+       | 客户端  |      | 客户端  |      | 客户端  |
+       | 客户端  |      | 客户端  |      | 客户端  |
        +---------+      +---------+      +---------+
 
-Channel Shards (64):
-  shard[0]: { channelA: [client1, client2], channelB: [client3] }
-  shard[1]: { channelC: [client4] }
+频道分片（64 个）：
+  shard[0]: { 频道A: [客户端1, 客户端2], 频道B: [客户端3] }
+  shard[1]: { 频道C: [客户端4] }
   ...
-  shard[63]: { channelZ: [clientN] }
+  shard[63]: { 频道Z: [客户端N] }
 ```
 
-Key design decisions:
-- **256 hash-bucketed client pools**: Clients are assigned to buckets by FNV-32a hash of their user ID. Each bucket runs its own goroutine, reducing lock contention compared to a single global lock.
-- **64-shard channel locks**: Channel membership is distributed across 64 shards by FNV-32a hash of the channel ID, enabling concurrent channel operations.
-- **Write-behind persistence**: Messages are broadcast immediately, then queued to a buffered channel (capacity 4096) for async database writes by a worker pool (NumCPU workers, minimum 2).
+关键设计决策：
+- **256 哈希分桶客户端池**：按用户 ID 的 FNV-32a 哈希分配桶，每桶独立 goroutine，降低锁竞争
+- **64 分片频道锁**：按频道 ID 的 FNV-32a 哈希分配分片，支持频道操作并发
+- **Write-behind 持久化**：消息先广播再入队（容量 4096 的 channel），由 Worker 池（CPU 核数个，最少 2 个）异步写库
 
-### Multi-Instance Scaling (Redis Pub/Sub)
+### 多实例扩展（Redis Pub/Sub）
 
 ```
-  Instance A                    Instance B
+  实例 A                        实例 B
   +----------+                  +----------+
   | Hub      |                  | Hub      |
-  | Client 1 |                  | Client 3 |
-  | Client 2 |                  | Client 4 |
+  | 客户端 1 |                  | 客户端 3 |
+  | 客户端 2 |                  | 客户端 4 |
   +----+-----+                  +----+-----+
        |                             |
        v                             v
   +----+-----------------------------+-----+
   |           Redis Pub/Sub                |
-  |  Channel: chat:ch:<channel_id>         |
+  |  频道：chat:ch:<channel_id>            |
   +----------------------------------------+
 ```
 
-When `REDIS_ADDR` is configured, the message bus automatically enables Redis Pub/Sub. Messages published to a channel are broadcast to all instances subscribing to that channel. The hub manages subscribe/unsubscribe lifecycle based on local client count.
+配置 `REDIS_ADDR` 后，消息总线自动启用 Redis Pub/Sub。发布到频道的消息会广播到所有订阅该频道的实例。Hub 根据本地客户端计数管理订阅/取消订阅的生命周期。
 
-### Data Models
+### 数据模型
 
-**User**
+**用户（User）**
 
-| Field | Type | Description |
+| 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` | varchar(36) | UUID primary key |
-| `username` | varchar(64) | Unique, alphanumeric + underscore |
-| `password_hash` | varchar(255) | bcrypt hash |
-| `role` | varchar(16) | `admin` or `user` |
-| `banned` | boolean | Account ban flag |
+| `id` | varchar(36) | UUID 主键 |
+| `username` | varchar(64) | 唯一，字母数字下划线 |
+| `password_hash` | varchar(255) | bcrypt 哈希 |
+| `role` | varchar(16) | `admin` 或 `user` |
+| `banned` | boolean | 封禁标志 |
 
-**Channel**
+**频道（Channel）**
 
-| Field | Type | Description |
+| 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` | varchar(36) | UUID primary key |
-| `name` | varchar(64) | Unique channel name |
-| `created_by` | varchar(36) | Creator user ID |
-| `created_at` | timestamp | Creation time |
+| `id` | varchar(36) | UUID 主键 |
+| `name` | varchar(64) | 唯一频道名 |
+| `created_by` | varchar(36) | 创建者用户 ID |
+| `created_at` | timestamp | 创建时间 |
 
-**Message**
+**消息（Message）**
 
-| Field | Type | Description |
+| 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` | varchar(36) | UUID primary key |
-| `channel_id` | varchar(36) | Indexed foreign key to channel |
-| `user_id` | varchar(36) | Author user ID |
-| `username` | varchar(64) | Author username (denormalized) |
-| `content` | text | Message body |
-| `created_at` | timestamp | Indexed creation time |
+| `id` | varchar(36) | UUID 主键 |
+| `channel_id` | varchar(36) | 索引外键，关联频道 |
+| `user_id` | varchar(36) | 作者用户 ID |
+| `username` | varchar(64) | 作者用户名（冗余字段） |
+| `content` | text | 消息内容 |
+| `created_at` | timestamp | 索引创建时间 |
 
-### Middleware Chain
+### 中间件链
 
-| Middleware | Purpose |
+| 中间件 | 作用 |
 |---|---|
-| `gin.Recovery()` | Catches panics, returns 500 |
-| `gzip.Gzip()` | Compresses responses (default level) |
-| `OtelMiddleware()` | Creates OpenTelemetry spans per request |
-| `LoggingMiddleware()` | Logs method, path, status, duration, IP, user-agent |
-| `AuthMiddleware()` | Validates JWT Bearer token, sets `user_id`, `username`, `role` in context |
-| `AdminMiddleware()` | Verifies admin role (falls back to DB query for legacy tokens) |
-| `RateLimitMiddleware()` | Redis sliding-window rate limit per client IP |
+| `gin.Recovery()` | 捕获 panic，返回 500 |
+| `gzip.Gzip()` | 响应压缩（默认级别） |
+| `OtelMiddleware()` | 为每个请求创建 OpenTelemetry Span |
+| `LoggingMiddleware()` | 记录请求方法、路径、状态码、耗时、IP、User-Agent |
+| `AuthMiddleware()` | 验证 JWT Bearer Token，将 `user_id`、`username`、`role` 存入 Context |
+| `AdminMiddleware()` | 校验管理员角色（旧 Token 无 role 时回退查库） |
+| `RateLimitMiddleware()` | Redis 滑动窗口限流（按客户端 IP） |
 
 ---
 
-## Makefile Commands
+## Makefile 命令
 
-| Command | Description |
+| 命令 | 说明 |
 |---|---|
-| `make build` | Build all three binaries (api, grpc, ws) to `bin/` |
-| `make run` | Run the API server directly |
-| `make start` | Run `start.bat` (Windows: Redis + API + Tunnel) |
-| `make run-grpc` | Run standalone gRPC server |
-| `make run-ws` | Run standalone WebSocket server |
-| `make test` | Run all tests with verbose output |
-| `make bench` | Run the built-in HTTP benchmark tool |
-| `make hotreload` | Run with file-watcher auto-restart |
-| `make proto` | Regenerate Protobuf Go code |
-| `make clean` | Remove `bin/` and generated protobuf files |
+| `make build` | 编译三个二进制文件（api、grpc、ws）到 `bin/` |
+| `make run` | 直接运行 API 服务器 |
+| `make start` | 运行 `start.bat`（Windows：Redis + API + Tunnel） |
+| `make run-grpc` | 运行独立 gRPC 服务器 |
+| `make run-ws` | 运行独立 WebSocket 服务器 |
+| `make test` | 运行所有测试（详细输出） |
+| `make bench` | 运行内置 HTTP 压测工具 |
+| `make hotreload` | 使用文件监听热重载运行 |
+| `make proto` | 重新生成 Protobuf Go 代码 |
+| `make clean` | 删除 `bin/` 目录和生成的 Protobuf 文件 |
 
 ---
 
-## gRPC Service
+## gRPC 服务
 
-The project includes a standalone gRPC server (`cmd/grpc/server.go`) with a sample Greeter service.
+项目包含一个独立 gRPC 服务器（`cmd/grpc/server.go`），内置示例 Greeter 服务。
 
-**Proto definition** (`proto/service.proto`):
+**Proto 定义**（`proto/service.proto`）：
 
 ```protobuf
 service Greeter {
@@ -750,12 +755,12 @@ service Greeter {
 }
 ```
 
-Run with: `make run-grpc` (listens on port 9090 by default).
+运行：`make run-grpc`（默认监听 9090 端口）。
 
-Features: keepalive (5 min max connection age), logging interceptor, panic recovery interceptor, health check service.
+特性：Keepalive（最大连接时长 5 分钟）、日志拦截器、Panic 恢复拦截器、健康检查服务。
 
 ---
 
-## License
+## 开源协议
 
-This project is for educational and demonstration purposes.
+本项目仅供学习和演示使用。

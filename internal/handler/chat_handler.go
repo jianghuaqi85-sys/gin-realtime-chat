@@ -1,0 +1,190 @@
+package handler
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"runtime"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/example/gin-high-performance/internal/repository"
+	"github.com/example/gin-high-performance/pkg/ws"
+)
+
+type ChatHandler struct {
+	channelRepo repository.ChannelRepository
+	messageRepo repository.MessageRepository
+	hub         *ws.Hub
+	bus         ws.MessageBus // 可选，为 nil 则单进程模式
+	persistCh   chan *repository.Message
+}
+
+func NewChatHandler(channelRepo repository.ChannelRepository, messageRepo repository.MessageRepository, hub *ws.Hub, bus ws.MessageBus) *ChatHandler {
+	h := &ChatHandler{
+		channelRepo: channelRepo,
+		messageRepo: messageRepo,
+		hub:         hub,
+		bus:         bus,
+		persistCh:   make(chan *repository.Message, 4096),
+	}
+	// 启动持久化 worker，数量等于 CPU 核数
+	workers := runtime.NumCPU()
+	if workers < 2 {
+		workers = 2
+	}
+	for i := 0; i < workers; i++ {
+		go h.persistWorker()
+	}
+	return h
+}
+
+func (h *ChatHandler) persistWorker() {
+	for msg := range h.persistCh {
+		if err := h.messageRepo.Create(msg); err != nil {
+			log.Printf("[WARN] 消息持久化失败: %v (channel=%s, user=%s)", err, msg.ChannelID, msg.Username)
+		}
+	}
+}
+
+type CreateChannelRequest struct {
+	Name string `json:"name" binding:"required"`
+}
+
+func (h *ChatHandler) CreateChannel(c *gin.Context) {
+	userID := c.MustGet("user_id").(string)
+
+	var req CreateChannelRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ch := &repository.Channel{
+		Name:      req.Name,
+		CreatedBy: userID,
+	}
+	if err := h.channelRepo.Create(ch); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建频道失败"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, ch)
+}
+
+func (h *ChatHandler) ListChannels(c *gin.Context) {
+	channels, err := h.channelRepo.List()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取频道列表失败"})
+		return
+	}
+	c.JSON(http.StatusOK, channels)
+}
+
+func (h *ChatHandler) GetMessages(c *gin.Context) {
+	channelID := c.Param("id")
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, _ := strconv.Atoi(limitStr)
+	before := c.Query("before")
+
+	var msgs []repository.Message
+	var err error
+	if before != "" {
+		t, parseErr := time.Parse(time.RFC3339, before)
+		if parseErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "分页参数格式错误"})
+			return
+		}
+		msgs, err = h.messageRepo.GetByChannelBefore(channelID, t, limit)
+	} else {
+		msgs, err = h.messageRepo.GetByChannel(channelID, limit)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取消息失败"})
+		return
+	}
+	c.JSON(http.StatusOK, msgs)
+}
+
+func (h *ChatHandler) EditMessage(c *gin.Context) {
+	userID := c.MustGet("user_id").(string)
+	msgID := c.Param("id")
+
+	var req struct {
+		Content string `json:"content" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := h.messageRepo.Update(msgID, req.Content); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "消息不存在"})
+		return
+	}
+
+	_ = userID
+	c.JSON(http.StatusOK, gin.H{"message": "编辑成功"})
+}
+
+func (h *ChatHandler) DeleteMyMessage(c *gin.Context) {
+	userID := c.MustGet("user_id").(string)
+	msgID := c.Param("id")
+
+	if err := h.messageRepo.DeleteByUser(msgID, userID); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "只能删除自己的消息"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
+
+// OnWSMessage — 先广播再异步持久化（write-behind 模式）
+func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
+	var msg ws.WSMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return
+	}
+
+	if !client.IsInChannel(msg.ChannelID) {
+		errMsg, _ := json.Marshal(ws.WSMessage{
+			Type:    "error",
+			Content: "你未加入此频道",
+		})
+		client.SendMessage(errMsg)
+		return
+	}
+
+	now := time.Now().Format(time.RFC3339)
+
+	outMsg, _ := json.Marshal(ws.WSMessage{
+		Type:      "message",
+		ChannelID: msg.ChannelID,
+		UserID:    client.GetUserID(),
+		Username:  client.GetUsername(),
+		Content:   msg.Content,
+		CreatedAt: now,
+	})
+
+	// 通过 Redis Pub/Sub 发布（多实例广播）或直接本地广播（单实例）
+	if h.bus != nil {
+		h.bus.Publish(msg.ChannelID, outMsg)
+	} else {
+		h.hub.BroadcastToChannel(msg.ChannelID, outMsg)
+	}
+
+	// 异步持久化到数据库（不阻塞广播）
+	dbMsg := &repository.Message{
+		ChannelID: msg.ChannelID,
+		UserID:    client.GetUserID(),
+		Username:  client.GetUsername(),
+		Content:   msg.Content,
+	}
+	select {
+	case h.persistCh <- dbMsg:
+	default:
+		log.Printf("[WARN] 持久化队列已满，消息可能丢失 (channel=%s)", msg.ChannelID)
+	}
+}

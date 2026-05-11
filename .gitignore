@@ -1,0 +1,25 @@
+# 环境配置（包含密钥）
+.env
+.tunnel_url
+
+# 编译产物
+*.exe
+bin/
+
+# Go
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 数据
+uploads/
+*.log

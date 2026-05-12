@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -552,12 +554,41 @@ func (c *Client) authenticate(validateToken TokenValidator) error {
 
 func checkOrigin(allowedOrigin string, r *http.Request) bool {
 	origin := r.Header.Get("Origin")
-	if origin == "" {
+
+	// 开发环境：允许无 Origin 的请求（如本地工具、Postman 等）
+	if os.Getenv("APP_ENV") != "production" && origin == "" {
 		return true
 	}
-	if allowedOrigin == "" {
-		host := r.Host
-		return origin == "http://"+host || origin == "https://"+host
+
+	// 生产环境：不允许空 Origin
+	if origin == "" {
+		return false
 	}
-	return origin == allowedOrigin
+
+	// 如果配置了允许的 Origin，精确匹配
+	if allowedOrigin != "" {
+		return origin == allowedOrigin
+	}
+
+	// 默认：检查 Origin 是否与 Host 匹配（防止跨站 WebSocket 劫持）
+	host := r.Host
+	// 移除端口号（如果有）
+	if idx := strings.Index(host, ":"); idx > 0 {
+		host = host[:idx]
+	}
+
+	// 提取 Origin 的主机部分
+	originHost := origin
+	// 移除协议前缀
+	originHost = strings.TrimPrefix(originHost, "http://")
+	originHost = strings.TrimPrefix(originHost, "https://")
+	// 移除端口号和路径
+	if idx := strings.Index(originHost, ":"); idx > 0 {
+		originHost = originHost[:idx]
+	}
+	if idx := strings.Index(originHost, "/"); idx > 0 {
+		originHost = originHost[:idx]
+	}
+
+	return originHost == host
 }

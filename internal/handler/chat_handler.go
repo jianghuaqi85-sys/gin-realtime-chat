@@ -14,6 +14,8 @@ import (
 	"github.com/example/gin-high-performance/pkg/ws"
 )
 
+const MaxMessageLength = 4096
+
 type ChatHandler struct {
 	channelRepo repository.ChannelRepository
 	messageRepo repository.MessageRepository
@@ -145,6 +147,16 @@ func (h *ChatHandler) DeleteMyMessage(c *gin.Context) {
 func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 	var msg ws.WSMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
+		return
+	}
+
+	// 消息长度限制，防止内存耗尽攻击
+	if len(msg.Content) > MaxMessageLength {
+		errMsg, _ := json.Marshal(ws.WSMessage{
+			Type:    "error",
+			Content: "消息内容过长，最多 4096 个字符",
+		})
+		client.SendMessage(errMsg)
 		return
 	}
 

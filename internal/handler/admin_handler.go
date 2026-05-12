@@ -106,7 +106,18 @@ func (h *AdminHandler) Ban(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "封禁用户失败"})
 		return
 	}
+
+	// 广播用户封禁事件给所有在线用户
+	banMsg, _ := json.Marshal(ws.WSMessage{
+		Type:    "user_banned",
+		UserID:  req.UserID,
+		Content: req.UserID,
+	})
+	h.hub.Broadcast(banMsg)
+
+	// 断开被封禁用户的连接（在广播之后，确保用户能收到通知）
 	h.hub.DisconnectUser(req.UserID)
+
 	c.JSON(http.StatusOK, gin.H{"banned": req.UserID})
 }
 
@@ -133,6 +144,14 @@ func (h *AdminHandler) DeleteChannel(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除频道失败"})
 		return
 	}
+
+	// 广播频道删除事件给所有在线用户
+	deleteMsg, _ := json.Marshal(ws.WSMessage{
+		Type:      "channel_deleted",
+		ChannelID: id,
+	})
+	h.hub.Broadcast(deleteMsg)
+
 	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }
 
@@ -143,16 +162,41 @@ func (h *AdminHandler) ClearMessages(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "清空消息失败"})
 		return
 	}
+
+	// 广播清空消息事件到该频道
+	clearMsg, _ := json.Marshal(ws.WSMessage{
+		Type:      "messages_cleared",
+		ChannelID: channelID,
+	})
+	h.hub.BroadcastToChannel(channelID, clearMsg)
+
 	c.JSON(http.StatusOK, gin.H{"cleared": channelID})
 }
 
 // DELETE /api/admin/messages/:id
 func (h *AdminHandler) DeleteMessage(c *gin.Context) {
 	id := c.Param("id")
+
+	// 先获取消息信息，以便广播到正确的频道
+	msg, err := h.messageRepo.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "消息不存在"})
+		return
+	}
+
 	if err := h.messageRepo.Delete(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除消息失败"})
 		return
 	}
+
+	// 广播消息删除事件到消息所属频道
+	deleteMsg, _ := json.Marshal(ws.WSMessage{
+		Type:      "message_deleted",
+		ChannelID: msg.ChannelID,
+		Content:   id,
+	})
+	h.hub.BroadcastToChannel(msg.ChannelID, deleteMsg)
+
 	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }
 

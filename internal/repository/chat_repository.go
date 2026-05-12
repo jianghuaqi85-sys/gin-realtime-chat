@@ -88,6 +88,7 @@ func (Message) TableName() string { return "messages" }
 
 type MessageRepository interface {
 	Create(msg *Message) error
+	GetByID(id string) (*Message, error)
 	GetByChannel(channelID string, limit int) ([]Message, error)
 	GetByChannelBefore(channelID string, before time.Time, limit int) ([]Message, error)
 	Update(id, content string) error
@@ -144,6 +145,14 @@ func (r *MySQLMessageRepository) GetByChannelBefore(channelID string, before tim
 		msgs[i], msgs[j] = msgs[j], msgs[i]
 	}
 	return msgs, nil
+}
+
+func (r *MySQLMessageRepository) GetByID(id string) (*Message, error) {
+	var msg Message
+	if err := r.db.Where("id = ?", id).First(&msg).Error; err != nil {
+		return nil, err
+	}
+	return &msg, nil
 }
 
 func (r *MySQLMessageRepository) Update(id, content string) error {

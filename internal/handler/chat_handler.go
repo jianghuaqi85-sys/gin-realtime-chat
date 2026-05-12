@@ -73,6 +73,15 @@ func (h *ChatHandler) CreateChannel(c *gin.Context) {
 		return
 	}
 
+	// 广播频道创建事件给所有在线用户
+	chMsg, _ := json.Marshal(ws.WSMessage{
+		Type:      "channel_created",
+		ChannelID: ch.ID,
+		Content:   ch.Name,
+		CreatedAt: ch.CreatedAt.Format(time.RFC3339),
+	})
+	h.hub.Broadcast(chMsg)
+
 	c.JSON(http.StatusCreated, ch)
 }
 
@@ -122,10 +131,26 @@ func (h *ChatHandler) EditMessage(c *gin.Context) {
 		return
 	}
 
-	if err := h.messageRepo.Update(msgID, req.Content); err != nil {
+	// 先获取消息信息，以便广播到正确的频道
+	msg, err := h.messageRepo.GetByID(msgID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "消息不存在"})
 		return
 	}
+
+	if err := h.messageRepo.Update(msgID, req.Content); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "编辑消息失败"})
+		return
+	}
+
+	// 广播消息编辑事件到消息所属频道
+	editMsg, _ := json.Marshal(ws.WSMessage{
+		Type:      "message_edited",
+		ChannelID: msg.ChannelID,
+		UserID:    userID,
+		Content:   req.Content,
+	})
+	h.hub.BroadcastToChannel(msg.ChannelID, editMsg)
 
 	_ = userID
 	c.JSON(http.StatusOK, gin.H{"message": "编辑成功"})
@@ -135,10 +160,25 @@ func (h *ChatHandler) DeleteMyMessage(c *gin.Context) {
 	userID := c.MustGet("user_id").(string)
 	msgID := c.Param("id")
 
+	// 先获取消息信息，以便广播到正确的频道
+	msg, err := h.messageRepo.GetByID(msgID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "消息不存在"})
+		return
+	}
+
 	if err := h.messageRepo.DeleteByUser(msgID, userID); err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "只能删除自己的消息"})
 		return
 	}
+
+	// 广播消息删除事件到消息所属频道
+	deleteMsg, _ := json.Marshal(ws.WSMessage{
+		Type:      "message_deleted",
+		ChannelID: msg.ChannelID,
+		Content:   msgID,
+	})
+	h.hub.BroadcastToChannel(msg.ChannelID, deleteMsg)
 
 	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
 }

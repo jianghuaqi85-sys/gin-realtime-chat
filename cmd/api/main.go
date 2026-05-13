@@ -158,6 +158,12 @@ func main() {
 		admin.DELETE("/messages/:id", adminHandler.DeleteMessage)
 		admin.POST("/broadcast", adminHandler.Broadcast)
 
+		// 超级管理员接口（仅 super_admin 可用）
+		superAdmin := api.Group("/admin")
+		superAdmin.Use(middleware.SuperAdminMiddleware(userRepo))
+		superAdmin.POST("/set-admin", adminHandler.SetAdmin)
+		superAdmin.POST("/remove-admin", adminHandler.RemoveAdmin)
+
 		// WebSocket — token 通过第一条 auth 消息传递，避免 URL 泄露
 		router.GET("/api/ws", func(c *gin.Context) {
 			validateToken := func(token string) (string, string, error) {

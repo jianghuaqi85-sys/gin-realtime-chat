@@ -52,6 +52,7 @@
 - 频道管理：列表、删除、清空消息
 - 全局广播公告
 - 管理员路由权限保护（基于角色的中间件）
+- **权限管理**：超级管理员可以设置/撤销其他用户的管理员权限
 
 ### 实时基础设施
 
@@ -99,6 +100,10 @@
   - 开发环境：允许无 Origin（方便 Postman 等工具测试）
   - 生产环境：严格检查 Origin 是否与 Host 匹配
 - **环境感知**：安全策略根据 `APP_ENV` 自动切换（`development` / `production`）
+- **层级权限系统**：
+  - 超级管理员（super_admin）：可授予/撤销管理员权限
+  - 管理员（admin）：有管理权限，但不能授予他人管理员权限
+  - 普通用户（user）：基本用户，无管理权限
 
 ### 部署
 
@@ -402,6 +407,8 @@ go run ./cmd/api/
 | `DELETE` | `/api/admin/channels/:id/messages` | 清空频道消息      |
 | `DELETE` | `/api/admin/messages/:id`          | 删除任意消息      |
 | `POST`   | `/api/admin/broadcast`             | 向所有用户发送系统公告 |
+| `POST`   | `/api/admin/set-admin`             | 设为管理员（仅超级管理员） |
+| `POST`   | `/api/admin/remove-admin`          | 撤销管理员（仅超级管理员） |
 
 #### GET /api/admin/stats
 

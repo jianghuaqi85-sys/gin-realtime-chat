@@ -16,7 +16,7 @@ type User struct {
 	ID           string `gorm:"primaryKey;type:varchar(36)"`
 	Username     string `gorm:"uniqueIndex;type:varchar(64);not null"`
 	PasswordHash string `gorm:"type:varchar(255);not null"`
-	Role         string `gorm:"type:varchar(16);default:user;not null"` // admin / user
+	Role         string `gorm:"type:varchar(16);default:user;not null"` // super_admin / admin / user
 	Banned       bool   `gorm:"default:false;not null"`
 }
 
@@ -57,7 +57,7 @@ func (r *InMemoryUserRepository) initDefaultUser() {
 		ID:           "1",
 		Username:     "admin",
 		PasswordHash: string(hash),
-		Role:         "admin",
+		Role:         "super_admin",
 	}
 }
 
@@ -194,7 +194,7 @@ func (r *MySQLUserRepository) initDefaultUser() {
 	var count int64
 	r.db.Model(&User{}).Where("username = ?", "admin").Count(&count)
 	if count > 0 {
-		r.db.Model(&User{}).Where("username = ?", "admin").Update("role", "admin")
+		r.db.Model(&User{}).Where("username = ?", "admin").Update("role", "super_admin")
 		return
 	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte("admin123"), bcrypt.DefaultCost)
@@ -202,7 +202,7 @@ func (r *MySQLUserRepository) initDefaultUser() {
 		ID:           uuid.New().String(),
 		Username:     "admin",
 		PasswordHash: string(hash),
-		Role:         "admin",
+		Role:         "super_admin",
 	})
 }
 

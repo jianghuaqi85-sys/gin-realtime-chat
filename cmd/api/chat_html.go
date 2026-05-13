@@ -1400,7 +1400,7 @@ async function doAuth(){
     btn.textContent='登录中...';
     const r=await fetch(API+'/api/public/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
     const d=await r.json();
-    if(d.token){token=d.token;myUsername=u;myRole=parseRoleFromToken(token);localStorage.setItem('token',token);localStorage.setItem('username',myUsername);localStorage.setItem('role',myRole);startApp();}
+    if(d.token){token=d.token;myUsername=u;myRole=parseRoleFromToken(token);localStorage.removeItem('token');localStorage.removeItem('username');localStorage.removeItem('role');localStorage.setItem('token',token);localStorage.setItem('username',myUsername);localStorage.setItem('role',myRole);console.log('Login role:',myRole);startApp();}
     else{document.getElementById('authError').textContent=d.error||'登录失败';}
   }finally{
     btn.disabled=false;
@@ -1417,7 +1417,7 @@ async function startApp(){
   const newChannelEl=document.querySelector('.new-channel');
   // 根据角色显示/隐藏在线用户列表
   const onlineUsersEl=document.getElementById('onlineUsers');
-  if(myRole==='admin'){
+  if(myRole==='admin'||myRole==='super_admin'){
     newChannelEl.style.display='flex';
     onlineUsersEl.style.display='block';
   }else{
@@ -1453,7 +1453,10 @@ async function startApp(){
 async function checkAdmin(){
   try{
     const r=await fetch(API+'/api/admin/stats',{headers:{'Authorization':'Bearer '+token}});
-    if(r.ok)document.getElementById('adminBtn').style.display='flex';
+    if(r.ok){
+      document.getElementById('adminBtn').style.display='flex';
+      console.log('Current role:',myRole);
+    }
   }catch(e){}
 }
 
@@ -1729,15 +1732,26 @@ async function loadAdminUsers(){
   const r=await fetch(API+'/api/admin/users',{headers:{'Authorization':'Bearer '+token}});
   const users=await r.json();
   const el=document.getElementById('userList');el.innerHTML='';
+  const isSuperAdmin=(myRole==='super_admin');
   users.forEach(u=>{
     const div=document.createElement('div');
     div.className='user-row';
-    const roleLabel=u.role==='admin'?'<span style="color:#07C160">管理员</span>':'普通用户';
+    let roleLabel='';
+    if(u.role==='super_admin'){roleLabel='<span style="color:#FF8800">超级管理员</span>';}
+    else if(u.role==='admin'){roleLabel='<span style="color:#07C160">管理员</span>';}
+    else{roleLabel='普通用户';}
     const banLabel=u.banned?'<span class="banned">已封禁</span>':'';
-    const actions=u.username!=='admin'?(
-      '<button class="btn-del-user" onclick="adminDeleteUser(\''+u.id+'\',\''+esc(u.username)+'\')">删除</button>'+
-      (u.banned?'<button class="btn-unban" onclick="adminUnban(\''+u.id+'\')">解封</button>':'<button class="btn-ban" onclick="adminBan(\''+u.id+'\')">封禁</button>')
-    ):'';
+    let actions='';
+    if(u.username!=='admin'){
+      actions+='<button class="btn-del-user" onclick="adminDeleteUser(\''+u.id+'\',\''+esc(u.username)+'\')">删除</button>';
+      if(u.banned){actions+='<button class="btn-unban" onclick="adminUnban(\''+u.id+'\')">解封</button>';}
+      else{actions+='<button class="btn-ban" onclick="adminBan(\''+u.id+'\')">封禁</button>';}
+      // 超级管理员可以设置/撤销管理员权限
+      if(isSuperAdmin&&u.role!=='super_admin'){
+        if(u.role==='admin'){actions+='<button class="btn-unban" onclick="adminRemoveAdmin(\''+u.id+'\')">撤销管理员</button>';}
+        else{actions+='<button class="btn-ban" onclick="adminSetAdmin(\''+u.id+'\')">设为管理员</button>';}
+      }
+    }
     div.innerHTML=avatarHTML(u.username)+'<div class="info"><div class="name">'+esc(u.username)+'</div><div class="role">'+roleLabel+' '+banLabel+'</div></div><div class="actions">'+actions+'</div>';
     el.appendChild(div);
   });
@@ -1772,6 +1786,20 @@ async function adminBan(uid){
 async function adminUnban(uid){
   await fetch(API+'/api/admin/unban',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({user_id:uid})});
   loadAdminUsers();
+}
+async function adminSetAdmin(uid){
+  if(!confirm('确定将该用户设为管理员？'))return;
+  const r=await fetch(API+'/api/admin/set-admin',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({user_id:uid})});
+  const d=await r.json();
+  if(r.ok){loadAdminUsers();}
+  else{alert(d.error||'设置失败');}
+}
+async function adminRemoveAdmin(uid){
+  if(!confirm('确定撤销该用户的管理员权限？'))return;
+  const r=await fetch(API+'/api/admin/remove-admin',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({user_id:uid})});
+  const d=await r.json();
+  if(r.ok){loadAdminUsers();}
+  else{alert(d.error||'撤销失败');}
 }
 async function adminDelChannel(id){
   if(!confirm('确定删除该频道及所有消息？'))return;

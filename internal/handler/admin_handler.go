@@ -93,6 +93,78 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"deleted": userID})
 }
 
+// POST /api/admin/set-admin  {user_id}
+func (h *AdminHandler) SetAdmin(c *gin.Context) {
+	var req struct {
+		UserID string `json:"user_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 检查目标用户是否存在
+	user, err := h.userRepo.GetUserByID(req.UserID)
+	if err != nil || user == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+
+	// 不能给自己设置管理员
+	currentUserID, _ := c.Get("user_id")
+	if currentUserID.(string) == req.UserID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不能给自己设置管理员"})
+		return
+	}
+
+	// 设置为管理员
+	if err := h.userRepo.SetRole(req.UserID, "admin"); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "设置管理员失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "设置管理员成功", "user_id": req.UserID})
+}
+
+// POST /api/admin/remove-admin  {user_id}
+func (h *AdminHandler) RemoveAdmin(c *gin.Context) {
+	var req struct {
+		UserID string `json:"user_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 检查目标用户是否存在
+	user, err := h.userRepo.GetUserByID(req.UserID)
+	if err != nil || user == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+
+	// 不能撤销自己的管理员权限
+	currentUserID, _ := c.Get("user_id")
+	if currentUserID.(string) == req.UserID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不能撤销自己的管理员权限"})
+		return
+	}
+
+	// 不能撤销 super_admin 的管理员权限
+	if user.Role == "super_admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "不能撤销超级管理员的权限"})
+		return
+	}
+
+	// 撤销管理员权限
+	if err := h.userRepo.SetRole(req.UserID, "user"); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "撤销管理员权限失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "撤销管理员权限成功", "user_id": req.UserID})
+}
+
 // POST /api/admin/ban  {user_id}
 func (h *AdminHandler) Ban(c *gin.Context) {
 	var req struct {

@@ -950,6 +950,20 @@ body{
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.online-list::-webkit-scrollbar{
+  width: 6px;
+}
+
+.online-list::-webkit-scrollbar-thumb{
+  background: var(--black);
+}
+
+.online-list::-webkit-scrollbar-track{
+  background: var(--gray);
 }
 
 .online-tag{
@@ -1223,6 +1237,19 @@ body{
   </div>
 </div>
 
+<!-- 修改用户名弹窗 -->
+<div class="modal-overlay" id="usernameModal">
+  <div class="modal-box">
+    <h3>修改用户名</h3>
+    <input id="newUsername" placeholder="新用户名（3-32 个字符）">
+    <div class="error" id="usernameError" style="min-height:18px;font-size:13px;margin-bottom:8px"></div>
+    <div class="modal-btns">
+      <button class="btn-cancel" onclick="closeChangeUsername()">取消</button>
+      <button class="btn-confirm" onclick="doChangeUsername()">确认修改</button>
+    </div>
+  </div>
+</div>
+
 <!-- 主界面 -->
 <div class="app" id="app">
 <div class="sidebar" id="sidebar">
@@ -1237,16 +1264,19 @@ body{
     </div>
   </div>
   <div class="channel-list" id="channelList"></div>
-  <div class="new-channel">
+  <div class="new-channel" style="display:none">
     <input id="newChannelName" placeholder="新建频道..." onkeydown="if(event.key==='Enter')createChannel()">
     <button onclick="createChannel()">+</button>
   </div>
-  <div class="online-users" id="onlineUsers">
+  <div class="online-users" id="onlineUsers" style="display:none">
     <div class="online-title">在线用户 (<span id="onlineCount">0</span>)</div>
     <div class="online-list" id="onlineList"></div>
   </div>
   <div class="admin-btn" onclick="showChangePassword()">
     <span class="icon">🔑</span> 修改密码
+  </div>
+  <div class="admin-btn" onclick="showChangeUsername()">
+    <span class="icon">✏️</span> 修改用户名
   </div>
   <div class="admin-btn" id="adminBtn" onclick="toggleAdmin()" style="display:none">
     <span class="icon">⚙</span> 管理面板
@@ -1303,7 +1333,7 @@ body{
 </div>
 
 <script>
-let token='',ws=null,currentChannel='',currentChannelName='',isRegister=false,myUsername='',lastMsgTime=0;
+let token='',ws=null,currentChannel='',currentChannelName='',isRegister=false,myUsername='',myRole='',lastMsgTime=0;
 let wsReconnectDelay=1000,wsReconnectAttempts=0,wsConnected=false,pollTimer=null;
 const API=location.origin;
 
@@ -1311,6 +1341,16 @@ const API=location.origin;
 const AVATAR_COLORS=['#07C160','#FA5151','#1989FA','#FF8800','#6467EF','#00B578','#FF6770','#576B95'];
 function avatarColor(name){let h=0;for(let i=0;i<name.length;i++)h=name.charCodeAt(i)+((h<<5)-h);return AVATAR_COLORS[Math.abs(h)%AVATAR_COLORS.length];}
 function avatarHTML(name){const d=document.createElement('div');d.textContent=name.charAt(0).toUpperCase();return '<div class="avatar" style="background:'+avatarColor(name)+'">'+d.innerHTML+'</div>';}
+
+// 解析 JWT token 获取角色
+function parseRoleFromToken(token){
+  try{
+    const parts=token.split('.');
+    if(parts.length!==3)return '';
+    const payload=JSON.parse(atob(parts[1]));
+    return payload.role||'';
+  }catch(e){return '';}
+}
 
 // 时间格式化
 function formatTime(ts){
@@ -1360,7 +1400,7 @@ async function doAuth(){
     btn.textContent='登录中...';
     const r=await fetch(API+'/api/public/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
     const d=await r.json();
-    if(d.token){token=d.token;myUsername=u;localStorage.setItem('token',token);localStorage.setItem('username',myUsername);startApp();}
+    if(d.token){token=d.token;myUsername=u;myRole=parseRoleFromToken(token);localStorage.setItem('token',token);localStorage.setItem('username',myUsername);localStorage.setItem('role',myRole);startApp();}
     else{document.getElementById('authError').textContent=d.error||'登录失败';}
   }finally{
     btn.disabled=false;
@@ -1373,6 +1413,34 @@ async function startApp(){
   document.getElementById('app').style.display='flex';
   document.getElementById('myAvatar').outerHTML=avatarHTML(myUsername).replace('class="avatar"','class="avatar" id="myAvatar"');
   document.getElementById('myName').textContent=myUsername;
+  // 根据角色显示/隐藏新建频道功能
+  const newChannelEl=document.querySelector('.new-channel');
+  // 根据角色显示/隐藏在线用户列表
+  const onlineUsersEl=document.getElementById('onlineUsers');
+  if(myRole==='admin'){
+    newChannelEl.style.display='flex';
+    onlineUsersEl.style.display='block';
+  }else{
+    newChannelEl.style.display='none';
+    onlineUsersEl.style.display='none';
+  }
+  // 消息区域右键菜单处理：自己的消息或管理员可以显示操作菜单
+  document.getElementById('messages').addEventListener('contextmenu',(e)=>{
+    const msgRow=e.target.closest('.msg-row');
+    if(msgRow){
+      const bubble=msgRow.querySelector('.bubble');
+      if(bubble?.dataset.msgid){
+        const isSelf=msgRow.classList.contains('self');
+        if(isSelf||myRole==='admin'){
+          e.preventDefault();
+          e.stopPropagation();
+          const msgUserId=isSelf?myUsername:bubble.dataset.userid;
+          showMsgActions(msgRow,bubble.dataset.msgid,msgUserId);
+        }
+      }
+    }
+    // 其他地方允许浏览器默认右键菜单
+  });
   await loadChannels();
   connectWS();
   checkAdmin();
@@ -1409,7 +1477,7 @@ async function createChannel(){
   if(!name)return;
   input.disabled=true;
   try{
-    await fetch(API+'/api/channels',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({name})});
+    await fetch(API+'/api/admin/channels',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({name})});
     input.value='';
     await loadChannels();
   }finally{
@@ -1498,7 +1566,7 @@ function connectWS(){
     }else if(msg.type==='message'&&msg.channel_id===currentChannel){
       const el=document.getElementById('messages');
       if(shouldShowTime(msg.created_at))appendTime(formatTime(msg.created_at));
-      appendMsg(msg.user_id,msg.username,msg.content);
+      appendMsg(msg.user_id,msg.username,msg.content,msg.id);
       el.scrollTop=el.scrollHeight;
     }else if(msg.type==='system'){
       if(!msg.channel_id||msg.channel_id===currentChannel){
@@ -1529,6 +1597,16 @@ function connectWS(){
       document.getElementById('messages').innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#bbb"><div style="text-align:center"><div style="font-size:48px;margin-bottom:12px">🧹</div><div>频道消息已被清空</div></div></div>';
     }else if(msg.type==='user_banned'){
       // 有用户被封禁，刷新在线用户列表
+      loadOnlineUsers();
+    }else if(msg.type==='username_updated'){
+      // 用户名更新，刷新在线用户列表和当前频道消息
+      loadOnlineUsers();
+      if(currentChannel)loadHistory(currentChannel);
+    }else if(msg.type==='user_online'){
+      // 有用户上线，刷新在线用户列表
+      loadOnlineUsers();
+    }else if(msg.type==='user_offline'){
+      // 有用户下线，刷新在线用户列表
       loadOnlineUsers();
     }
   };
@@ -1759,6 +1837,38 @@ async function doChangePassword(){
   }catch(e){errEl.textContent='网络错误';}
 }
 
+// ===== 修改用户名 =====
+function showChangeUsername(){
+  document.getElementById('newUsername').value='';
+  document.getElementById('usernameError').textContent='';
+  document.getElementById('usernameModal').classList.add('show');
+}
+function closeChangeUsername(){
+  document.getElementById('usernameModal').classList.remove('show');
+}
+async function doChangeUsername(){
+  const newUsername=document.getElementById('newUsername').value.trim();
+  const errEl=document.getElementById('usernameError');
+  errEl.textContent='';
+  if(!newUsername){errEl.textContent='请输入新用户名';return;}
+  if(newUsername.length<3||newUsername.length>32){errEl.textContent='用户名长度需要 3-32 个字符';return;}
+  if(!/^[a-zA-Z0-9_一-龥]+$/.test(newUsername)){errEl.textContent='用户名只能包含字母、数字、下划线和中文';return;}
+  try{
+    const r=await fetch(API+'/api/username',{method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({new_username:newUsername})});
+    const d=await r.json();
+    if(r.ok){
+      closeChangeUsername();
+      myUsername=newUsername;
+      localStorage.setItem('username',myUsername);
+      if(d.token){token=d.token;localStorage.setItem('token',token);}
+      document.getElementById('myName').textContent=myUsername;
+      alert('用户名修改成功');
+    }else{
+      errEl.textContent=d.error||'修改失败';
+    }
+  }catch(e){errEl.textContent='网络错误';}
+}
+
 // ===== 消息分页（向上滚动加载更多） =====
 let isLoadingMore=false,hasMoreMessages=true;
 function setupMessageScroll(){
@@ -1806,22 +1916,31 @@ function createMsgElement(userId,username,content,msgId){
     div.innerHTML='<div class="avatar" style="background:'+avatarColor(username)+'">'+esc(username.charAt(0).toUpperCase())+'</div><div class="content"><div class="bubble" data-msgid="'+(msgId||'')+'">'+esc(content)+'</div></div>';
     if(msgId){
       let pressTimer;
-      div.addEventListener('touchstart',()=>{pressTimer=setTimeout(()=>showMsgActions(div,msgId),500);});
+      div.addEventListener('touchstart',()=>{pressTimer=setTimeout(()=>showMsgActions(div,msgId,username),500);});
       div.addEventListener('touchend',()=>clearTimeout(pressTimer));
-      div.addEventListener('contextmenu',(e)=>{e.preventDefault();showMsgActions(div,msgId);});
     }
   }else{
     div.className='msg-row';
-    div.innerHTML=avatarHTML(username)+'<div class="content"><div class="name">'+esc(username)+'</div><div class="bubble">'+esc(content)+'</div></div>';
+    div.innerHTML=avatarHTML(username)+'<div class="content"><div class="name">'+esc(username)+'</div><div class="bubble" data-msgid="'+(msgId||'')+'" data-userid="'+esc(username)+'">'+esc(content)+'</div></div>';
+    if(msgId&&(myRole==='admin')){
+      let pressTimer;
+      div.addEventListener('touchstart',()=>{pressTimer=setTimeout(()=>showMsgActions(div,msgId,username),500);});
+      div.addEventListener('touchend',()=>clearTimeout(pressTimer));
+    }
   }
   return div;
 }
-function showMsgActions(rowEl,msgId){
+function showMsgActions(rowEl,msgId,msgUserId){
   document.querySelectorAll('.msg-actions').forEach(el=>el.remove());
   const bubble=rowEl.querySelector('.bubble');
   const menu=document.createElement('div');
   menu.className='msg-actions';
-  menu.innerHTML='<button onclick="editMsg(this,\''+esc(msgId)+'\')">编辑</button><button class="danger" onclick="deleteMsg(this,\''+esc(msgId)+'\')">删除</button>';
+  const isSelf=(msgUserId===myUsername);
+  let menuHtml='<button onclick="editMsg(this,\''+esc(msgId)+'\')">编辑</button>';
+  if(isSelf||myRole==='admin'){
+    menuHtml+='<button class="danger" onclick="deleteMsg(this,\''+esc(msgId)+'\','+(isSelf?'\'self\'':'\'admin\'')+')">删除</button>';
+  }
+  menu.innerHTML=menuHtml;
   bubble.style.position='relative';
   bubble.appendChild(menu);
   menu.style.display='block';
@@ -1843,26 +1962,38 @@ async function editMsg(btn,msgId){
     else{alert('编辑失败');}
   }catch(e){alert('编辑失败');}
 }
-async function deleteMsg(btn,msgId){
+async function deleteMsg(btn,msgId,type){
   if(!confirm('确定删除这条消息？'))return;
+  console.log('Deleting message:',msgId,'type:',type);
   try{
-    const r=await fetch(API+'/api/messages/'+msgId,{method:'DELETE',headers:{'Authorization':'Bearer '+token}});
-    if(r.ok){btn.closest('.msg-row').remove();}
-    else{alert('删除失败');}
-  }catch(e){alert('删除失败');}
+    const url=(type==='admin')?API+'/api/admin/messages/'+msgId:API+'/api/messages/'+msgId;
+    console.log('Delete URL:',url);
+    const r=await fetch(url,{method:'DELETE',headers:{'Authorization':'Bearer '+token}});
+    console.log('Response status:',r.status);
+    const d=await r.json();
+    console.log('Response body:',d);
+    if(r.ok){
+      const row=btn.closest('.msg-row');
+      if(row)row.remove();
+    }else{
+      alert('删除失败: '+(d.error||'未知错误'));
+    }
+  }catch(e){console.log('Delete error:',e);alert('删除失败: '+e.message);}
 }
 
 // 页面加载时自动恢复登录状态
 (async function(){
   const savedToken=localStorage.getItem('token');
   const savedUser=localStorage.getItem('username');
+  const savedRole=localStorage.getItem('role');
   if(savedToken&&savedUser){
     try{
       const r=await fetch(API+'/api/me',{headers:{'Authorization':'Bearer '+savedToken}});
-      if(r.ok){token=savedToken;myUsername=savedUser;startApp();return;}
+      if(r.ok){token=savedToken;myUsername=savedUser;myRole=savedRole||parseRoleFromToken(savedToken);startApp();return;}
     }catch(e){}
     localStorage.removeItem('token');
     localStorage.removeItem('username');
+    localStorage.removeItem('role');
   }
 })();
 </script>

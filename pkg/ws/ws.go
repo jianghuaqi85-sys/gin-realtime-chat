@@ -36,6 +36,7 @@ type WSMessage struct {
 	Username  string `json:"username,omitempty"`
 	CreatedAt string `json:"created_at,omitempty"`
 	Token     string `json:"token,omitempty"`
+	MessageID string `json:"id,omitempty"`
 }
 
 type Client struct {
@@ -216,6 +217,14 @@ func (h *Hub) Unregister(client *Client) {
 	if client.bucket != nil {
 		client.bucket.unregister <- client
 	}
+
+	// 广播用户下线事件
+	offlineMsg, _ := json.Marshal(WSMessage{
+		Type:    "user_offline",
+		UserID:  client.userID,
+		Content: client.username,
+	})
+	h.Broadcast(offlineMsg)
 }
 
 func (h *Hub) JoinChannel(client *Client, channelID string) {
@@ -368,6 +377,18 @@ func (h *Hub) DisconnectUser(userID string) int {
 	return count
 }
 
+func (h *Hub) UpdateUsername(userID, newUsername string) {
+	for _, bucket := range h.buckets {
+		bucket.mu.Lock()
+		for client := range bucket.clients {
+			if client.userID == userID {
+				client.username = newUsername
+			}
+		}
+		bucket.mu.Unlock()
+	}
+}
+
 func (h *Hub) BroadcastSystemAll(content string) {
 	msg, _ := json.Marshal(WSMessage{
 		Type:      "system",
@@ -516,6 +537,14 @@ func ServeWS(hub *Hub, origin string, readLimit int, validateToken TokenValidato
 
 	authOK, _ := json.Marshal(WSMessage{Type: "auth_ok", Content: client.username})
 	client.SendMessage(authOK)
+
+	// 广播用户上线事件
+	onlineMsg, _ := json.Marshal(WSMessage{
+		Type:    "user_online",
+		UserID:  client.userID,
+		Content: client.username,
+	})
+	hub.Broadcast(onlineMsg)
 
 	go client.WritePump()
 	client.ReadPump()

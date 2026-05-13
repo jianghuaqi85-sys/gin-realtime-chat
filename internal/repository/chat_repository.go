@@ -165,9 +165,6 @@ func (r *MySQLMessageRepository) Update(id, content string) error {
 
 func (r *MySQLMessageRepository) DeleteByUser(id, userID string) error {
 	result := r.db.Where("id = ? AND user_id = ?", id, userID).Delete(&Message{})
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("message not found or not owned by user")
-	}
 	return result.Error
 }
 

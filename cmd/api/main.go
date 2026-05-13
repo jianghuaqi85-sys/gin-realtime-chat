@@ -112,8 +112,8 @@ func main() {
 	router.Use(middleware.OtelMiddleware())
 	router.Use(middleware.LoggingMiddleware())
 
-	authHandler := handler.NewAuthHandler(cfg, userRepo)
 	hub := ws.NewHub()
+	authHandler := handler.NewAuthHandler(cfg, userRepo, hub)
 	if messageBus != nil {
 		hub.SetBus(messageBus)
 	}
@@ -133,7 +133,7 @@ func main() {
 		api.Use(middleware.RateLimitMiddleware(rateLimiter, 100, time.Minute))
 		api.GET("/me", authHandler.Me)
 		api.PUT("/password", authHandler.ChangePassword)
-		api.POST("/channels", chatHandler.CreateChannel)
+		api.PUT("/username", authHandler.ChangeUsername)
 		api.GET("/channels", chatHandler.ListChannels)
 		api.GET("/channels/:id/messages", chatHandler.GetMessages)
 		api.PUT("/messages/:id", chatHandler.EditMessage)
@@ -152,6 +152,7 @@ func main() {
 		admin.DELETE("/users/:id", adminHandler.DeleteUser)
 		admin.POST("/ban", adminHandler.Ban)
 		admin.POST("/unban", adminHandler.Unban)
+		admin.POST("/channels", chatHandler.CreateChannel)
 		admin.DELETE("/channels/:id", adminHandler.DeleteChannel)
 		admin.DELETE("/channels/:id/messages", adminHandler.ClearMessages)
 		admin.DELETE("/messages/:id", adminHandler.DeleteMessage)

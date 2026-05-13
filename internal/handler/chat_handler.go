@@ -14,7 +14,7 @@ import (
 	"github.com/example/gin-high-performance/pkg/ws"
 )
 
-const MaxMessageLength = 4096
+const MaxMessageLength = 200
 
 type ChatHandler struct {
 	channelRepo repository.ChannelRepository
@@ -159,18 +159,23 @@ func (h *ChatHandler) EditMessage(c *gin.Context) {
 func (h *ChatHandler) DeleteMyMessage(c *gin.Context) {
 	userID := c.MustGet("user_id").(string)
 	msgID := c.Param("id")
+	log.Printf("[DEBUG] DeleteMyMessage: msgID=%s, userID=%s", msgID, userID)
 
 	// 先获取消息信息，以便广播到正确的频道
 	msg, err := h.messageRepo.GetByID(msgID)
 	if err != nil {
+		log.Printf("[DEBUG] GetByID failed: %v", err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "消息不存在"})
 		return
 	}
+	log.Printf("[DEBUG] GetByID success: msg.UserID=%s", msg.UserID)
 
 	if err := h.messageRepo.DeleteByUser(msgID, userID); err != nil {
+		log.Printf("[DEBUG] DeleteByUser failed: %v", err)
 		c.JSON(http.StatusForbidden, gin.H{"error": "只能删除自己的消息"})
 		return
 	}
+	log.Printf("[DEBUG] DeleteByUser success")
 
 	// 广播消息删除事件到消息所属频道
 	deleteMsg, _ := json.Marshal(ws.WSMessage{
@@ -183,7 +188,7 @@ func (h *ChatHandler) DeleteMyMessage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
 }
 
-// OnWSMessage — 先广播再异步持久化（write-behind 模式）
+// OnWSMessage — 先同步持久化获取消息 ID，再广播
 func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 	var msg ws.WSMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
@@ -194,7 +199,7 @@ func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 	if len(msg.Content) > MaxMessageLength {
 		errMsg, _ := json.Marshal(ws.WSMessage{
 			Type:    "error",
-			Content: "消息内容过长，最多 4096 个字符",
+			Content: "消息内容过长，最多 200 个字符",
 		})
 		client.SendMessage(errMsg)
 		return
@@ -209,6 +214,18 @@ func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 		return
 	}
 
+	// 先同步持久化到数据库，获取消息 ID
+	dbMsg := &repository.Message{
+		ChannelID: msg.ChannelID,
+		UserID:    client.GetUserID(),
+		Username:  client.GetUsername(),
+		Content:   msg.Content,
+	}
+	if err := h.messageRepo.Create(dbMsg); err != nil {
+		log.Printf("[WARN] 消息持久化失败: %v (channel=%s, user=%s)", err, msg.ChannelID, client.GetUsername())
+		return
+	}
+
 	now := time.Now().Format(time.RFC3339)
 
 	outMsg, _ := json.Marshal(ws.WSMessage{
@@ -218,6 +235,7 @@ func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 		Username:  client.GetUsername(),
 		Content:   msg.Content,
 		CreatedAt: now,
+		MessageID: dbMsg.ID,
 	})
 
 	// 通过 Redis Pub/Sub 发布（多实例广播）或直接本地广播（单实例）
@@ -225,18 +243,5 @@ func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 		h.bus.Publish(msg.ChannelID, outMsg)
 	} else {
 		h.hub.BroadcastToChannel(msg.ChannelID, outMsg)
-	}
-
-	// 异步持久化到数据库（不阻塞广播）
-	dbMsg := &repository.Message{
-		ChannelID: msg.ChannelID,
-		UserID:    client.GetUserID(),
-		Username:  client.GetUsername(),
-		Content:   msg.Content,
-	}
-	select {
-	case h.persistCh <- dbMsg:
-	default:
-		log.Printf("[WARN] 持久化队列已满，消息可能丢失 (channel=%s)", msg.ChannelID)
 	}
 }

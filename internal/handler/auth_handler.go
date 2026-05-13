@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
@@ -12,17 +13,19 @@ import (
 	"github.com/example/gin-high-performance/internal/config"
 	"github.com/example/gin-high-performance/internal/repository"
 	"github.com/example/gin-high-performance/pkg/jwt"
+	"github.com/example/gin-high-performance/pkg/ws"
 )
 
-var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_\p{Han}]+$`)
 
 type AuthHandler struct {
 	cfg  *config.Config
 	repo repository.UserRepository
+	hub  *ws.Hub
 }
 
-func NewAuthHandler(cfg *config.Config, repo repository.UserRepository) *AuthHandler {
-	return &AuthHandler{cfg: cfg, repo: repo}
+func NewAuthHandler(cfg *config.Config, repo repository.UserRepository, hub *ws.Hub) *AuthHandler {
+	return &AuthHandler{cfg: cfg, repo: repo, hub: hub}
 }
 
 type LoginRequest struct {
@@ -97,7 +100,7 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		return
 	}
 	if !usernameRegex.MatchString(req.Username) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名只能包含字母、数字和下划线"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名只能包含字母、数字、下划线和中文"})
 		return
 	}
 	if pwdLen := utf8.RuneCountInString(req.Password); pwdLen < 8 {
@@ -169,4 +172,68 @@ func (h *AuthHandler) ChangePassword(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "密码修改成功"})
+}
+
+type ChangeUsernameRequest struct {
+	NewUsername string `json:"new_username" binding:"required"`
+}
+
+func (h *AuthHandler) ChangeUsername(c *gin.Context) {
+	var req ChangeUsernameRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	newUsername := req.NewUsername
+	if nameLen := utf8.RuneCountInString(newUsername); nameLen < 3 || nameLen > 32 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名长度需要 3-32 个字符"})
+		return
+	}
+	if !usernameRegex.MatchString(newUsername) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户名只能包含字母、数字、下划线和中文"})
+		return
+	}
+
+	userID, _ := c.Get("user_id")
+	if err := h.repo.SetUsername(userID.(string), newUsername); err != nil {
+		if errors.Is(err, repository.ErrUserExists) {
+			c.JSON(http.StatusConflict, gin.H{"error": "用户名已被占用"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户名修改失败"})
+		return
+	}
+
+	// 更新 WebSocket Hub 中的用户名
+	h.hub.UpdateUsername(userID.(string), newUsername)
+
+	// 广播用户名更新事件给所有在线用户
+	updateMsg, _ := json.Marshal(ws.WSMessage{
+		Type:    "username_updated",
+		UserID:  userID.(string),
+		Content: newUsername,
+	})
+	h.hub.Broadcast(updateMsg)
+
+	// 生成新 token（包含新用户名）
+	user, _ := h.repo.GetUserByID(userID.(string))
+	if user == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户不存在"})
+		return
+	}
+
+	newToken, err := jwt.GenerateToken(
+		h.cfg.JWTSecret,
+		user.ID,
+		user.Username,
+		user.Role,
+		h.cfg.JWTExpireHours,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成 token 失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "用户名修改成功", "token": newToken})
 }

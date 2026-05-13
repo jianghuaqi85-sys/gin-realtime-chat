@@ -29,6 +29,7 @@ type UserRepository interface {
 	GetUserByID(id string) (*User, error)
 	CreateUser(username, passwordHash string) error
 	SetPasswordHash(username, hash string) error
+	SetUsername(userID, newUsername string) error
 	List() ([]User, error)
 	SetRole(userID, role string) error
 	SetBanned(userID string, banned bool) error
@@ -108,6 +109,27 @@ func (r *InMemoryUserRepository) SetPasswordHash(username, hash string) error {
 	}
 	user.PasswordHash = hash
 	return nil
+}
+
+func (r *InMemoryUserRepository) SetUsername(userID, newUsername string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// 检查新用户名是否已存在
+	for _, u := range r.users {
+		if u.Username == newUsername && u.ID != userID {
+			return ErrUserExists
+		}
+	}
+	// 找到用户并更新用户名
+	for oldUsername, u := range r.users {
+		if u.ID == userID {
+			u.Username = newUsername
+			r.users[newUsername] = u
+			delete(r.users, oldUsername)
+			return nil
+		}
+	}
+	return fmt.Errorf("user %q not found", userID)
 }
 
 func (r *InMemoryUserRepository) List() ([]User, error) {
@@ -228,6 +250,29 @@ func (r *MySQLUserRepository) SetPasswordHash(username, hash string) error {
 		return fmt.Errorf("user %q not found", username)
 	}
 	return result.Error
+}
+
+func (r *MySQLUserRepository) SetUsername(userID, newUsername string) error {
+	// 检查新用户名是否已存在
+	var count int64
+	r.db.Model(&User{}).Where("username = ? AND id != ?", newUsername, userID).Count(&count)
+	if count > 0 {
+		return ErrUserExists
+	}
+	// 获取旧用户名
+	var user User
+	if err := r.db.Where("id = ?", userID).First(&user).Error; err != nil {
+		return fmt.Errorf("user %q not found", userID)
+	}
+	oldUsername := user.Username
+	// 更新用户表中的用户名
+	result := r.db.Model(&User{}).Where("id = ?", userID).Update("username", newUsername)
+	if result.Error != nil {
+		return result.Error
+	}
+	// 更新所有历史消息中的用户名
+	r.db.Model(&Message{}).Where("username = ?", oldUsername).Update("username", newUsername)
+	return nil
 }
 
 func (r *MySQLUserRepository) List() ([]User, error) {

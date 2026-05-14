@@ -1493,7 +1493,14 @@ function toggleSidebar(){
   document.getElementById('sidebar').classList.toggle('hidden');
 }
 function selectChannel(id,name){
-  if(currentChannel===id)return;
+  if(currentChannel===id){
+    // 点击当前频道：刷新消息
+    document.getElementById('messages').innerHTML='';
+    lastMsgTime=0;firstMsgTime='';hasMoreMessages=true;
+    loadHistory(id);
+    if(window.innerWidth<=768)document.getElementById('sidebar').classList.add('hidden');
+    return;
+  }
   if(currentChannel&&ws&&ws.readyState===1)ws.send(JSON.stringify({type:'leave',channel_id:currentChannel}));
   currentChannel=id;currentChannelName=name;
   document.getElementById('chatTitle').textContent=name;

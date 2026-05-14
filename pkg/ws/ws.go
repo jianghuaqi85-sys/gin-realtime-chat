@@ -584,8 +584,8 @@ func (c *Client) authenticate(validateToken TokenValidator) error {
 func checkOrigin(allowedOrigin string, r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 
-	// 开发环境：允许无 Origin 的请求（如本地工具、Postman 等）
-	if os.Getenv("APP_ENV") != "production" && origin == "" {
+	// 开发环境：允许所有请求（方便调试）
+	if os.Getenv("APP_ENV") != "production" {
 		return true
 	}
 

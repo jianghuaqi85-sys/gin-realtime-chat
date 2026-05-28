@@ -6,6 +6,10 @@
 
 基于 Go + Gin 框架的高性能实时聊天服务器，支持 WebSocket 消息推送、多频道聊天、管理面板、Redis Pub/Sub 水平扩展、Cloudflare Tunnel 一键公网穿透，内置单页聊天 UI。
 
+### 界面预览
+
+![Neo-Brutalism 风格聊天室界面](assets/gin_chat_ui.png)
+
 ---
 
 ## 技术栈

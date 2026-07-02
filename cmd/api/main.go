@@ -129,7 +129,7 @@ func main() {
 		})
 
 		api := router.Group("/api")
-		api.Use(middleware.AuthMiddleware(cfg))
+		api.Use(middleware.AuthMiddleware(cfg, userRepo))
 		api.Use(middleware.RateLimitMiddleware(rateLimiter, 100, time.Minute))
 		api.GET("/me", authHandler.Me)
 		api.PUT("/password", authHandler.ChangePassword)
@@ -144,9 +144,9 @@ func main() {
 
 		// 管理员接口
 		adminHandler := handler.NewAdminHandler(userRepo, channelRepo, messageRepo, hub)
-		api.GET("/tunnel", adminHandler.Tunnel)
 		admin := api.Group("/admin")
 		admin.Use(middleware.AdminMiddleware(userRepo))
+		admin.GET("/tunnel", adminHandler.Tunnel)
 		admin.GET("/stats", adminHandler.Stats)
 		admin.GET("/users", adminHandler.ListUsers)
 		admin.DELETE("/users/:id", adminHandler.DeleteUser)

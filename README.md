@@ -62,11 +62,11 @@
 
 - WebSocket Hub 256 分桶架构，降低锁竞争
 - 64 分片频道锁，细粒度并发控制
-- Write-behind 消息持久化：先广播再异步写库
+- 消息同步持久化：先写库获取 ID，再向频道广播
 - Redis Pub/Sub 消息总线，支持多实例水平扩展
 - 优雅关闭：断开前通知所有客户端
 - 指数退避重连 + HTTP 轮询降级（客户端侧）
-- WebSocket 升级请求的 Origin 校验
+- WebSocket 升级请求的 Origin 校验（统一收口，无重复检查）
 
 ### 实时同步
 
@@ -86,9 +86,9 @@
 - 数据库连接池调优：50 空闲 / 200 最大 / 1 小时生命周期
 - Redis Lua 脚本原子化滑动窗口限流
 - sync.Pool 复用日志字段 Map，减少 GC 压力
-- 持久化 Worker 池（CPU 核数个 goroutine）异步写库
-- FNV-32a 哈希分桶（客户端桶 + 频道锁）
+- FNV-32a 哈希分桶（客户端桶 + 频道锁），`DisconnectUser`/`UpdateUsername` 精准定位桶，O(N/256)
 - WebSocket 读写截止时间管理
+- `UserRepository.Count()` 接口：统计接口无需全量加载用户列表
 
 ### 可观测性
 
@@ -98,11 +98,16 @@
 
 ### 安全加固
 
-- **消息长度限制**：单条消息最大 200 字符，防止内存耗尽攻击
+- **消息长度限制**：单条消息最大 4096 字节，防止内存耗尽攻击
 - **日志 IP 脱敏**：生产环境自动隐藏 IP 最后一位（如 `192.168.1.***`）
-- **WebSocket Origin 检查**：防止跨站 WebSocket 劫持（CSWSH）攻击
+- **WebSocket Origin 检查**：防止跨站 WebSocket 劫持（CSWSH）攻击，检查逻辑统一收口，无双重冲突
   - 开发环境：允许无 Origin（方便 Postman 等工具测试）
   - 生产环境：严格检查 Origin 是否与 Host 匹配
+- **封禁立即生效**：`AuthMiddleware` 每次请求实时查库校验封禁状态，被 ban 用户无需等待 JWT 过期即被拒绝
+- **消息归属权校验**：编辑消息时服务端校验 `msg.UserID == 当前用户ID`，防止越权编辑他人消息
+- **管理员初始密码安全**：通过 `ADMIN_INITIAL_PASSWORD` 环境变量配置，未设置时启动日志打印警告
+- **Tunnel 接口权限保护**：`/api/admin/tunnel` 已移入管理员路由组，需要管理员角色
+- **用户名更新事务**：用户名修改与历史消息用户名同步在同一数据库事务中完成，保证数据一致性
 - **环境感知**：安全策略根据 `APP_ENV` 自动切换（`development` / `production`）
 - **层级权限系统**：
   - 超级管理员（super_admin）：可授予/撤销管理员权限
@@ -240,12 +245,18 @@ go run ./cmd/api/
 
 ### 5. 默认管理员账号
 
-| 字段  | 值          |
-| --- | ---------- |
-| 用户名 | `admin`    |
-| 密码  | `admin123` |
+| 字段  | 值                                              |
+| --- | ---------------------------------------------- |
+| 用户名 | `admin`                                        |
+| 密码  | 由 `ADMIN_INITIAL_PASSWORD` 环境变量指定              |
 
-首次登录后请立即修改密码。
+**强烈建议** 在 `.env` 中设置初始密码：
+
+```env
+ADMIN_INITIAL_PASSWORD=your_strong_password_here
+```
+
+若未设置该变量，系统将回退到默认值 `admin123` 并在启动日志中打印醒目警告。**请在首次登录后立即修改密码。**
 
 ---
 
@@ -304,17 +315,16 @@ go run ./cmd/api/
 
 ### 认证接口
 
-| 方法       | 路径                           | 说明         |
-| -------- | ---------------------------- | ---------- |
-| `GET`    | `/api/me`                    | 获取当前用户信息   |
-| `PUT`    | `/api/password`              | 修改密码       |
-| `GET`    | `/api/channels`              | 获取频道列表     |
-| `POST`   | `/api/channels`              | 创建频道       |
-| `GET`    | `/api/channels/:id/messages` | 获取频道消息（分页） |
-| `PUT`    | `/api/messages/:id`          | 编辑自己的消息    |
-| `DELETE` | `/api/messages/:id`          | 删除自己的消息    |
-| `GET`    | `/api/online`                | 获取在线用户列表   |
-| `GET`    | `/api/tunnel`                | 获取公网隧道地址   |
+| 方法       | 路径                           | 说明                          |
+| -------- | ---------------------------- | ----------------------------- |
+| `GET`    | `/api/me`                    | 获取当前用户信息                  |
+| `PUT`    | `/api/password`              | 修改密码                        |
+| `PUT`    | `/api/username`              | 修改用户名                       |
+| `GET`    | `/api/channels`              | 获取频道列表                      |
+| `GET`    | `/api/channels/:id/messages` | 获取频道消息（分页，limit 上限 200）    |
+| `PUT`    | `/api/messages/:id`          | 编辑自己的消息（服务端校验归属权）          |
+| `DELETE` | `/api/messages/:id`          | 删除自己的消息                     |
+| `GET`    | `/api/online`                | 获取在线用户列表                    |
 
 认证接口限流：100 次/分钟/IP。
 
@@ -398,21 +408,22 @@ go run ./cmd/api/
 
 ### 管理员接口
 
-所有管理员接口需要认证 + 管理员角色。
+所有管理员接口需要认证 + 管理员角色（`admin` 或 `super_admin`）。
 
-| 方法       | 路径                                 | 说明          |
-| -------- | ---------------------------------- | ----------- |
-| `GET`    | `/api/admin/stats`                 | 服务器统计       |
-| `GET`    | `/api/admin/users`                 | 用户列表        |
-| `DELETE` | `/api/admin/users/:id`             | 删除用户（先断开连接） |
-| `POST`   | `/api/admin/ban`                   | 封禁用户        |
-| `POST`   | `/api/admin/unban`                 | 解封用户        |
-| `DELETE` | `/api/admin/channels/:id`          | 删除频道及其消息    |
-| `DELETE` | `/api/admin/channels/:id/messages` | 清空频道消息      |
-| `DELETE` | `/api/admin/messages/:id`          | 删除任意消息      |
-| `POST`   | `/api/admin/broadcast`             | 向所有用户发送系统公告 |
-| `POST`   | `/api/admin/set-admin`             | 设为管理员（仅超级管理员） |
-| `POST`   | `/api/admin/remove-admin`          | 撤销管理员（仅超级管理员） |
+| 方法       | 路径                                 | 说明                     |
+| -------- | ---------------------------------- | ------------------------ |
+| `GET`    | `/api/admin/tunnel`                | 获取公网隧道地址（需管理员）         |
+| `GET`    | `/api/admin/stats`                 | 服务器统计（用 COUNT 查询，无性能损耗）|
+| `GET`    | `/api/admin/users`                 | 用户列表                    |
+| `DELETE` | `/api/admin/users/:id`             | 删除用户（先断开连接）            |
+| `POST`   | `/api/admin/ban`                   | 封禁用户（立即断开其 WebSocket 连接）|
+| `POST`   | `/api/admin/unban`                 | 解封用户                    |
+| `DELETE` | `/api/admin/channels/:id`          | 删除频道及其消息                |
+| `DELETE` | `/api/admin/channels/:id/messages` | 清空频道消息                  |
+| `DELETE` | `/api/admin/messages/:id`          | 删除任意消息                  |
+| `POST`   | `/api/admin/broadcast`             | 向所有用户发送系统公告             |
+| `POST`   | `/api/admin/set-admin`             | 设为管理员（仅 super_admin）    |
+| `POST`   | `/api/admin/remove-admin`          | 撤销管理员（仅 super_admin）    |
 
 #### GET /api/admin/stats
 
@@ -536,25 +547,26 @@ go run ./cmd/api/
 
 所有配置从 `.env` 文件和/或环境变量加载，环境变量优先。
 
-| 变量                  | 类型     | 默认值              | 说明                                                      |
-| ------------------- | ------ | ---------------- | ------------------------------------------------------- |
-| `APP_ENV`           | string | `development`    | 应用环境。`production` 模式启用日志 IP 脱敏和 WebSocket Origin 严格检查 |
-| `APP_PORT`          | string | `8080`           | HTTP API 服务器端口                                          |
-| `GRPC_PORT`         | string | `9090`           | gRPC 服务器端口（独立模式）                                        |
-| `WS_PORT`           | string | `8081`           | WebSocket 服务器端口（独立模式）                                   |
-| `JWT_SECRET`        | string | **（必填）**         | JWT 签名密钥，至少 32 个字符                                      |
-| `JWT_EXPIRE_HOURS`  | int    | `24`             | JWT Token 过期时间（小时）                                      |
-| `REDIS_ADDR`        | string | `localhost:6379` | Redis 服务器地址                                             |
-| `REDIS_PASSWORD`    | string | *(空)*            | Redis 认证密码                                              |
-| `REDIS_DB`          | int    | `0`              | Redis 数据库编号                                             |
-| `MYSQL_DSN`         | string | *(空)*            | MySQL 连接字符串。留空则使用内存存储，聊天功能不可用                           |
-| `OTEL_ENDPOINT`     | string | *(空)*            | OpenTelemetry 采集器端点。设为 `stdout` 或留空输出到控制台               |
-| `OTEL_INSECURE`     | bool   | `true`           | 允许不安全的 OTLP HTTP 连接                                     |
-| `LOG_LEVEL`         | string | `info`           | 日志级别：`trace`, `debug`, `info`, `warn`, `error`, `fatal` |
-| `DB_LOG_LEVEL`      | string | `warn`           | GORM SQL 日志级别：`silent`, `error`, `warn`, `info`         |
-| `WS_ALLOWED_ORIGIN` | string | *(空)*            | 允许的 WebSocket Origin。留空则只允许同源连接                         |
-| `WS_READ_LIMIT`     | int    | `512`            | WebSocket 消息最大字节数                                       |
-| `CLOUDFLARED_PATH`  | string | *(空)*            | `cloudflared` 可执行文件路径。设置后启动时自动开启 Cloudflare Tunnel      |
+| 变量                       | 类型     | 默认值              | 说明                                                      |
+| ------------------------ | ------ | ---------------- | ------------------------------------------------------- |
+| `APP_ENV`                | string | `development`    | 应用环境。`production` 模式启用日志 IP 脱敏和 WebSocket Origin 严格检查 |
+| `APP_PORT`               | string | `8080`           | HTTP API 服务器端口                                          |
+| `GRPC_PORT`              | string | `9090`           | gRPC 服务器端口（独立模式）                                        |
+| `WS_PORT`                | string | `8081`           | WebSocket 服务器端口（独立模式）                                   |
+| `JWT_SECRET`             | string | **（必填）**         | JWT 签名密钥，至少 32 个字符                                      |
+| `JWT_EXPIRE_HOURS`       | int    | `24`             | JWT Token 过期时间（小时）                                      |
+| `ADMIN_INITIAL_PASSWORD` | string | `admin123`       | 初始管理员密码。**强烈建议设置**，未设置时启动日志打印警告                         |
+| `REDIS_ADDR`             | string | `localhost:6379` | Redis 服务器地址                                             |
+| `REDIS_PASSWORD`         | string | *(空)*            | Redis 认证密码                                              |
+| `REDIS_DB`               | int    | `0`              | Redis 数据库编号                                             |
+| `MYSQL_DSN`              | string | *(空)*            | MySQL 连接字符串。留空则使用内存存储，聊天功能不可用                           |
+| `OTEL_ENDPOINT`          | string | *(空)*            | OpenTelemetry 采集器端点。设为 `stdout` 或留空输出到控制台               |
+| `OTEL_INSECURE`          | bool   | `true`           | 允许不安全的 OTLP HTTP 连接                                     |
+| `LOG_LEVEL`              | string | `info`           | 日志级别：`trace`, `debug`, `info`, `warn`, `error`, `fatal` |
+| `DB_LOG_LEVEL`           | string | `warn`           | GORM SQL 日志级别：`silent`, `error`, `warn`, `info`         |
+| `WS_ALLOWED_ORIGIN`      | string | *(空)*            | 允许的 WebSocket Origin。留空则只允许同源连接                         |
+| `WS_READ_LIMIT`          | int    | `512`            | WebSocket 消息最大字节数                                       |
+| `CLOUDFLARED_PATH`       | string | *(空)*            | `cloudflared` 可执行文件路径。设置后启动时自动开启 Cloudflare Tunnel      |
 
 ### MySQL DSN 格式
 
@@ -607,13 +619,16 @@ go run ./cmd/api
 
 | 措施 | 位置 | 说明 |
 |------|------|------|
-| 消息长度限制 | `chat_handler.go` | 单条消息最大 200 字符 |
+| 消息长度限制 | `chat_handler.go` | 单条消息最大 4096 字节 |
 | 日志 IP 脱敏 | `logging.go` | 生产环境隐藏 IP 最后一位 |
-| WebSocket Origin 检查 | `ws.go` | 防止跨站 WebSocket 劫持 |
-| JWT 认证 | `auth.go` | Token 过期时间可配置 |
-| 密码 bcrypt 哈希 | `user_repository.go` | 密码不可逆存储 |
+| WebSocket Origin 检查 | `ws.go` | 防止跨站 WebSocket 劫持，逻辑统一收口 |
+| JWT 认证 + 实时封禁校验 | `auth.go` | Token 过期可配置；封禁后每次请求均检查，无需等待 Token 过期 |
+| 消息归属权校验 | `chat_handler.go` | 编辑消息时服务端强制校验归属，防越权 |
+| 初始密码环境变量化 | `user_repository.go` | 从 `ADMIN_INITIAL_PASSWORD` 读取，避免硬编码 |
+| 密码 bcrypt 哈希 | `user_repository.go` | 密码不可逆存储，bcrypt 错误不再被忽略 |
 | Redis 滑动窗口限流 | `rate_limit.go` | 防止暴力破解和 DDoS |
-| 管理员权限控制 | `admin_middleware.go` | 基于角色的访问控制 |
+| 管理员权限控制 | `admin.go` | 基于角色的访问控制 |
+| Tunnel 接口鉴权 | `admin_handler.go` | 公网地址查询接口移入管理员路由，普通用户不可访问 |
 
 ---
 
@@ -753,9 +768,9 @@ set REDIS_CONFIG=D:\Redis\redis.windows.conf
 
 关键设计决策：
 
-- **256 哈希分桶客户端池**：按用户 ID 的 FNV-32a 哈希分配桶，每桶独立 goroutine，降低锁竞争
+- **256 哈希分桶客户端池**：按用户 ID 的 FNV-32a 哈希分配桶，每桶独立 goroutine，降低锁竞争；`DisconnectUser`/`UpdateUsername` 通过同一哈希直接定位目标桶，无需全量扫描
 - **64 分片频道锁**：按频道 ID 的 FNV-32a 哈希分配分片，支持频道操作并发
-- **Write-behind 持久化**：消息先广播再入队（容量 4096 的 channel），由 Worker 池（CPU 核数个，最少 2 个）异步写库
+- **同步持久化**：消息先写库获取数据库 ID，再向频道广播；保证广播消息携带有效 ID，客户端可精准追踪消息
 
 ### 多实例扩展（Redis Pub/Sub）
 
@@ -815,10 +830,10 @@ set REDIS_CONFIG=D:\Redis\redis.windows.conf
 | `gin.Recovery()`        | 捕获 panic，返回 500                                              |
 | `gzip.Gzip()`           | 响应压缩（默认级别）                                                   |
 | `OtelMiddleware()`      | 为每个请求创建 OpenTelemetry Span                                   |
-| `LoggingMiddleware()`   | 记录请求方法、路径、状态码、耗时、IP、User-Agent                               |
-| `AuthMiddleware()`      | 验证 JWT Bearer Token，将 `user_id`、`username`、`role` 存入 Context |
-| `AdminMiddleware()`     | 校验管理员角色（旧 Token 无 role 时回退查库）                                |
-| `RateLimitMiddleware()` | Redis 滑动窗口限流（按客户端 IP）                                        |
+| `LoggingMiddleware()`   | 记录请求方法、路径、状态码、耗时、IP、User-Agent                                                      |
+| `AuthMiddleware()`      | 验证 JWT Bearer Token + 实时查库检查封禁状态，将 `user_id`、`username`、`role` 存入 Context |
+| `AdminMiddleware()`     | 校验管理员角色（旧 Token 无 role 时回退查库）                                                      |
+| `RateLimitMiddleware()` | Redis 滑动窗口限流（按客户端 IP）                                                               |
 
 ---
 
@@ -854,6 +869,36 @@ service Greeter {
 运行：`make run-grpc`（默认监听 9090 端口）。
 
 特性：Keepalive（最大连接时长 5 分钟）、日志拦截器、Panic 恢复拦截器、健康检查服务。
+
+---
+
+## 变更日志
+
+### 2026-07-03 安全加固 & 架构修复
+
+**安全修复（P0）**
+
+- 🔒 **修复越权编辑漏洞**：`EditMessage` 增加 `msg.UserID == userID` 服务端校验，任何用户无法编辑他人消息
+- 🔒 **封禁立即生效**：`AuthMiddleware` 签名更新为 `AuthMiddleware(cfg, userRepo)`，每次请求实时查库检查封禁状态，不再依赖 JWT 自然过期
+- 🔒 **管理员初始密码安全化**：移除硬编码 `admin123`，改为从 `ADMIN_INITIAL_PASSWORD` 环境变量读取；bcrypt 错误不再被 `_` 忽略
+- 🔒 **WebSocket Upgrader CheckOrigin 统一**：Upgrader 设为 `always true`，Origin 检查统一由 `checkOrigin()` 函数单点把守，消除双重逻辑冲突
+- 🔒 **Tunnel 接口移入管理员路由**：`GET /api/tunnel` → `GET /api/admin/tunnel`，普通用户不再能查询公网地址
+
+**数据一致性修复（P1）**
+
+- 🛠 **`SetUsername` 事务化**：用户表更新与历史消息用户名同步现在在同一个数据库事务中执行，防止部分失败导致数据不一致
+- 🛠 **移除死代码**：删除从未写入的 `persistCh` channel 和相关 `persistWorker` goroutine（启动了 CPU 核数个 goroutine 但 channel 永远为空）
+
+**性能优化（P2）**
+
+- ⚡ **`UserRepository` 新增 `Count()` 接口**：`GET /api/admin/stats` 不再全量加载用户列表，改用 `COUNT(*)` 查询
+- ⚡ **`DisconnectUser`/`UpdateUsername` 精准定位**：利用 FNV-32a 哈希直接定位目标桶，从遍历全部 256 个桶降至仅操作 1 个桶
+
+**代码质量（P3）**
+
+- 🧹 移除 `DeleteMyMessage` 中残留的 5 条 `[DEBUG]` 日志（生产环境泄露用户 ID）
+- 🧹 `GetMessages` 的 `limit` 参数解析错误不再被 `_` 忽略，错误时回退到默认值 50
+- 🧹 新增 `.gitattributes`，统一 LF 换行符策略（`.bat`/`.ps1` 保留 CRLF）
 
 ---
 

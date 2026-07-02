@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"runtime"
 	"strconv"
 	"time"
 
@@ -14,42 +13,24 @@ import (
 	"github.com/example/gin-high-performance/pkg/ws"
 )
 
-const MaxMessageLength = 200
+const MaxMessageLength = 4096
 
 type ChatHandler struct {
 	channelRepo repository.ChannelRepository
 	messageRepo repository.MessageRepository
 	hub         *ws.Hub
 	bus         ws.MessageBus // 可选，为 nil 则单进程模式
-	persistCh   chan *repository.Message
 }
 
 func NewChatHandler(channelRepo repository.ChannelRepository, messageRepo repository.MessageRepository, hub *ws.Hub, bus ws.MessageBus) *ChatHandler {
-	h := &ChatHandler{
+	return &ChatHandler{
 		channelRepo: channelRepo,
 		messageRepo: messageRepo,
 		hub:         hub,
 		bus:         bus,
-		persistCh:   make(chan *repository.Message, 4096),
 	}
-	// 启动持久化 worker，数量等于 CPU 核数
-	workers := runtime.NumCPU()
-	if workers < 2 {
-		workers = 2
-	}
-	for i := 0; i < workers; i++ {
-		go h.persistWorker()
-	}
-	return h
 }
 
-func (h *ChatHandler) persistWorker() {
-	for msg := range h.persistCh {
-		if err := h.messageRepo.Create(msg); err != nil {
-			log.Printf("[WARN] 消息持久化失败: %v (channel=%s, user=%s)", err, msg.ChannelID, msg.Username)
-		}
-	}
-}
 
 type CreateChannelRequest struct {
 	Name string `json:"name" binding:"required"`
@@ -97,7 +78,13 @@ func (h *ChatHandler) ListChannels(c *gin.Context) {
 func (h *ChatHandler) GetMessages(c *gin.Context) {
 	channelID := c.Param("id")
 	limitStr := c.DefaultQuery("limit", "50")
-	limit, _ := strconv.Atoi(limitStr)
+	limit, limitErr := strconv.Atoi(limitStr)
+	if limitErr != nil || limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
 	before := c.Query("before")
 
 	var msgs []repository.Message
@@ -131,10 +118,14 @@ func (h *ChatHandler) EditMessage(c *gin.Context) {
 		return
 	}
 
-	// 先获取消息信息，以便广播到正确的频道
+	// 先获取消息，校验归属权
 	msg, err := h.messageRepo.GetByID(msgID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "消息不存在"})
+		return
+	}
+	if msg.UserID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "只能编辑自己的消息"})
 		return
 	}
 
@@ -152,30 +143,24 @@ func (h *ChatHandler) EditMessage(c *gin.Context) {
 	})
 	h.hub.BroadcastToChannel(msg.ChannelID, editMsg)
 
-	_ = userID
 	c.JSON(http.StatusOK, gin.H{"message": "编辑成功"})
 }
 
 func (h *ChatHandler) DeleteMyMessage(c *gin.Context) {
 	userID := c.MustGet("user_id").(string)
 	msgID := c.Param("id")
-	log.Printf("[DEBUG] DeleteMyMessage: msgID=%s, userID=%s", msgID, userID)
 
 	// 先获取消息信息，以便广播到正确的频道
 	msg, err := h.messageRepo.GetByID(msgID)
 	if err != nil {
-		log.Printf("[DEBUG] GetByID failed: %v", err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "消息不存在"})
 		return
 	}
-	log.Printf("[DEBUG] GetByID success: msg.UserID=%s", msg.UserID)
 
 	if err := h.messageRepo.DeleteByUser(msgID, userID); err != nil {
-		log.Printf("[DEBUG] DeleteByUser failed: %v", err)
 		c.JSON(http.StatusForbidden, gin.H{"error": "只能删除自己的消息"})
 		return
 	}
-	log.Printf("[DEBUG] DeleteByUser success")
 
 	// 广播消息删除事件到消息所属频道
 	deleteMsg, _ := json.Marshal(ws.WSMessage{
@@ -199,7 +184,7 @@ func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 	if len(msg.Content) > MaxMessageLength {
 		errMsg, _ := json.Marshal(ws.WSMessage{
 			Type:    "error",
-			Content: "消息内容过长，最多 200 个字符",
+			Content: "消息内容过长，最多 4096 个字符",
 		})
 		client.SendMessage(errMsg)
 		return

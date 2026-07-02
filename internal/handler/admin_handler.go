@@ -31,7 +31,7 @@ func NewAdminHandler(userRepo repository.UserRepository, channelRepo repository.
 
 // GET /api/admin/stats
 func (h *AdminHandler) Stats(c *gin.Context) {
-	users, err := h.userRepo.List()
+	userCount, err := h.userRepo.Count()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取用户统计失败"})
 		return
@@ -49,12 +49,13 @@ func (h *AdminHandler) Stats(c *gin.Context) {
 	online := h.hub.OnlineCount()
 
 	c.JSON(http.StatusOK, gin.H{
-		"users_total": len(users),
+		"users_total": userCount,
 		"online":      online,
 		"channels":    chCount,
 		"messages":    msgCount,
 	})
 }
+
 
 // GET /api/admin/users
 func (h *AdminHandler) ListUsers(c *gin.Context) {

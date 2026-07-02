@@ -6,10 +6,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/example/gin-high-performance/internal/config"
+	"github.com/example/gin-high-performance/internal/repository"
 	"github.com/example/gin-high-performance/pkg/jwt"
 )
 
-func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
+// AuthMiddleware 验证 JWT 并检查封禁状态。
+// userRepo 用于实时查询 ban 状态，确保封禁立即生效（不依赖 token 过期）。
+func AuthMiddleware(cfg *config.Config, userRepo repository.UserRepository) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
@@ -29,9 +32,21 @@ func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 			return
 		}
 
+		// 实时检查封禁状态，确保 ban 操作立即生效
+		user, err := userRepo.GetUserByID(claims.UserID)
+		if err != nil || user == nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "user not found"})
+			return
+		}
+		if user.Banned {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "账号已被封禁"})
+			return
+		}
+
 		c.Set("user_id", claims.UserID)
 		c.Set("username", claims.Username)
 		c.Set("role", claims.Role)
 		c.Next()
 	}
 }
+

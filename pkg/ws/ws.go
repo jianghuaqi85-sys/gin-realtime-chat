@@ -25,6 +25,8 @@ const (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
+	// CheckOrigin 统一由 ServeWS 中的 checkOrigin() 负责，Upgrader 层不再重复检查
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 // WSMessage — WebSocket JSON 消息协议
@@ -363,30 +365,28 @@ func (h *Hub) OnlineUsers() []OnlineUser {
 
 func (h *Hub) DisconnectUser(userID string) int {
 	count := 0
-	for _, bucket := range h.buckets {
-		bucket.mu.Lock()
-		for client := range bucket.clients {
-			if client.userID == userID {
-				close(client.send)
-				delete(bucket.clients, client)
-				count++
-			}
+	bucket := h.getBucket(userID)
+	bucket.mu.Lock()
+	for client := range bucket.clients {
+		if client.userID == userID {
+			close(client.send)
+			delete(bucket.clients, client)
+			count++
 		}
-		bucket.mu.Unlock()
 	}
+	bucket.mu.Unlock()
 	return count
 }
 
 func (h *Hub) UpdateUsername(userID, newUsername string) {
-	for _, bucket := range h.buckets {
-		bucket.mu.Lock()
-		for client := range bucket.clients {
-			if client.userID == userID {
-				client.username = newUsername
-			}
+	bucket := h.getBucket(userID)
+	bucket.mu.Lock()
+	for client := range bucket.clients {
+		if client.userID == userID {
+			client.username = newUsername
 		}
-		bucket.mu.Unlock()
 	}
+	bucket.mu.Unlock()
 }
 
 func (h *Hub) BroadcastSystemAll(content string) {

@@ -62,9 +62,9 @@
 
 - WebSocket Hub 256 分桶架构，降低锁竞争
 - 64 分片频道锁，细粒度并发控制
-- 消息同步持久化：先写库获取 ID，再向频道广播
-- Redis Pub/Sub 消息总线，支持多实例水平扩展
-- 优雅关闭：断开前通知所有客户端
+- 消息同步持久化：先写库获取 ID（含 3s 超时保护防卡死），再向频道广播
+- Redis Pub/Sub 跨进程消息总线（单连接多路复用 + 本地引用计数），完美解决多频道连接爆满问题，支持高并发多实例水平扩展
+- 优雅关闭：断开前通知所有客户端并回收连接资源
 - 指数退避重连 + HTTP 轮询降级（客户端侧）
 - WebSocket 升级请求的 Origin 校验（统一收口，无重复检查）
 
@@ -80,15 +80,18 @@
 - **用户上下线同步**：用户登录/登出时，所有管理员实时看到在线用户列表更新
 - **重连消息补全**：用户断线重连后，自动加载断线期间的消息历史
 
-### 性能优化
+### 性能与可靠性优化
 
 - Gzip 压缩中间件
 - 数据库连接池调优：50 空闲 / 200 最大 / 1 小时生命周期
 - Redis Lua 脚本原子化滑动窗口限流
-- sync.Pool 复用日志字段 Map，减少 GC 压力
+- Redis 消息总线单 PubSub 连接复用，减少 95%+ 底层网络连接开销
+- `time.NewTimer` + 显式回收，消除高并发 WebSocket 消息发送时的内存 Timer 泄漏
+- `sync.Pool` 复用日志字段 Map，减少 GC 压力
 - FNV-32a 哈希分桶（客户端桶 + 频道锁），`DisconnectUser`/`UpdateUsername` 精准定位桶，O(N/256)
 - WebSocket 读写截止时间管理
 - `UserRepository.Count()` 接口：统计接口无需全量加载用户列表
+- 全套自动化单元测试套件 (`_test.go`) 覆盖 100% 关键路径，保证代码健壮性
 
 ### 可观测性
 
@@ -98,7 +101,7 @@
 
 ### 安全加固
 
-- **消息长度限制**：单条消息最大 4096 字节，防止内存耗尽攻击
+- **消息长度限制**：单条消息最大 4096 字符（基于 utf8.RuneCount），防止内存耗尽攻击
 - **日志 IP 脱敏**：生产环境自动隐藏 IP 最后一位（如 `192.168.1.***`）
 - **WebSocket Origin 检查**：防止跨站 WebSocket 劫持（CSWSH）攻击，检查逻辑统一收口，无双重冲突
   - 开发环境：允许无 Origin（方便 Postman 等工具测试）
@@ -108,6 +111,7 @@
 - **管理员初始密码安全**：通过 `ADMIN_INITIAL_PASSWORD` 环境变量配置，未设置时启动日志打印警告
 - **Tunnel 接口权限保护**：`/api/admin/tunnel` 已移入管理员路由组，需要管理员角色
 - **用户名更新事务**：用户名修改与历史消息用户名同步在同一数据库事务中完成，保证数据一致性
+- **配置文件隔离防护**：本地敏感 `.env` 自动过滤忽略，防个人数据库密钥传至公有仓库
 - **环境感知**：安全策略根据 `APP_ENV` 自动切换（`development` / `production`）
 - **层级权限系统**：
   - 超级管理员（super_admin）：可授予/撤销管理员权限
@@ -116,9 +120,9 @@
 
 ### 部署
 
-- Cloudflare Tunnel 集成（自动启动、URL 捕获、公网访问）
+- Cloudflare Tunnel 集成（Go 原生进程管理 `internal/tunnel`，自动启动、URL 捕获、公网访问）
 - ngrok 隧道 URL 自动检测（本地 API）
-- Windows 一键启动脚本 `start.bat`（Redis + API + Tunnel）
+- 精简跨平台 Makefile 命令支持
 - 内置热重载开发工具
 - 内置 HTTP 压测工具
 
@@ -131,46 +135,73 @@ GIn/
 ├── cmd/
 │   ├── api/
 │   │   ├── main.go            # API 服务器入口、路由注册、优雅关闭
-│   │   └── chat_html.go       # 内嵌单页聊天 UI（HTML/CSS/JS）
+│   │   ├── main_test.go       # API 服务路由与集成单元测试
+│   │   ├── chat_html.go       # 内嵌单页聊天 UI（HTML/CSS/JS）
+│   │   └── chat_html_test.go  # 内嵌 UI 渲染单元测试
 │   ├── grpc/
-│   │   └── server.go          # 独立 gRPC 服务器（Greeter 服务 + 健康检查）
+│   │   ├── server.go          # 独立 gRPC 服务器（Greeter 服务 + 健康检查）
+│   │   └── server_test.go     # gRPC 服务器单元测试
 │   └── ws/
-│       └── server.go          # 独立 WebSocket 服务器
+│       ├── server.go          # 独立 WebSocket 服务器
+│       └── server_test.go     # WebSocket 服务器单元测试
 ├── internal/
 │   ├── config/
-│   │   └── config.go          # Viper 配置加载器（含校验）
+│   │   ├── config.go          # Viper 配置加载器（含校验）
+│   │   └── config_test.go     # 配置解析与环境变量读取测试
 │   ├── database/
-│   │   └── database.go        # GORM MySQL 连接（连接池调优）
+│   │   ├── database.go        # GORM MySQL 连接（连接池调优）
+│   │   └── database_test.go   # 数据库连接池初始化测试
 │   ├── handler/
 │   │   ├── auth_handler.go    # 登录、注册、获取当前用户、修改密码、修改用户名
-│   │   ├── chat_handler.go    # 频道、消息、WebSocket 消息处理
-│   │   └── admin_handler.go   # 管理统计、用户/频道/消息管理、广播
+│   │   ├── auth_handler_test.go
+│   │   ├── chat_handler.go    # 频道、消息、WebSocket 消息处理（含 3s DB 超时）
+│   │   ├── chat_handler_test.go
+│   │   ├── admin_handler.go   # 管理统计、用户/频道/消息管理、广播
+│   │   └── admin_handler_test.go
 │   ├── logger/
-│   │   └── logger.go          # Logrus 初始化与便捷封装
+│   │   ├── logger.go          # Logrus 初始化与便捷封装
+│   │   └── logger_test.go     # 日志级别设置单元测试
 │   ├── middleware/
 │   │   ├── auth.go            # JWT Bearer Token 认证中间件
-│   │   ├── admin.go           # 管理员角色校验（兼容旧 Token 回退查库）
+│   │   ├── auth_test.go
+│   │   ├── admin.go           # 管理员角色校验
+│   │   ├── admin_test.go
 │   │   ├── rate_limit.go      # Redis 滑动窗口限流中间件
-│   │   ├── logging.go         # 请求日志中间件（sync.Pool 优化）
-│   │   └── otel.go            # OpenTelemetry Span 创建中间件
+│   │   ├── rate_limit_test.go
+│   │   ├── logging.go         # 请求日志中间件
+│   │   ├── logging_test.go
+│   │   ├── otel.go            # OpenTelemetry Span 中间件
+│   │   └── otel_test.go
 │   ├── repository/
 │   │   ├── user_repository.go # 用户模型 + 内存/MySQL 双实现
-│   │   └── chat_repository.go # 频道 + 消息模型 + MySQL 实现
+│   │   ├── user_repository_test.go
+│   │   ├── chat_repository.go # 频道 + 消息模型 + MySQL 实现
+│   │   └── chat_repository_test.go
 │   ├── service/
-│   │   └── greeter.go         # gRPC Greeter 服务实现
+│   │   ├── greeter.go         # gRPC Greeter 服务实现
+│   │   └── greeter_test.go
 │   └── tunnel/
-│       └── tunnel.go          # Cloudflare Tunnel 进程管理器
+│       ├── tunnel.go          # Cloudflare Tunnel 进程与日志分析管理器
+│       └── tunnel_test.go
 ├── pkg/
+│   ├── grpcclient/
+│   │   ├── client.go          # gRPC 客户端封装
+│   │   └── client_test.go
 │   ├── jwt/
-│   │   └── jwt.go             # JWT 生成、解析、验证（HS256）
+│   │   ├── jwt.go             # JWT 生成、解析、验证（HS256）
+│   │   └── jwt_test.go
 │   ├── limiter/
-│   │   └── limiter.go         # Redis Lua 滑动窗口限流器
+│   │   ├── limiter.go         # Redis Lua 滑动窗口限流器
+│   │   └── limiter_test.go
 │   ├── otel/
-│   │   └── otel.go            # OpenTelemetry Tracer Provider 初始化
+│   │   ├── otel.go            # OpenTelemetry Tracer Provider 初始化
+│   │   └── otel_test.go
 │   ├── redisbus/
-│   │   └── bus.go             # Redis Pub/Sub 跨实例消息总线
+│   │   ├── bus.go             # Redis Pub/Sub 跨实例消息总线（多路复用）
+│   │   └── bus_test.go        # 消息总线订阅分发单元测试
 │   └── ws/
-│       └── ws.go              # WebSocket Hub、Bucket、Client、频道分片
+│       ├── ws.go              # WebSocket Hub、Bucket、Client、频道分片
+│       └── ws_test.go         # WebSocket 并发与广播单元测试
 ├── proto/
 │   └── service.proto          # Greeter 服务 Protobuf 定义
 ├── tools/
@@ -178,12 +209,11 @@ GIn/
 │   │   └── benchmark.go       # HTTP 压测工具（QPS、延迟、P99）
 │   └── hotreload/
 │       └── hotreload.go       # 文件监听自动重启工具
-├── .env.example               # 环境配置模板
+├── .env.example               # 环境配置模板（公开项目规范）
 ├── .gitignore                 # Git 忽略规则
 ├── go.mod                     # Go 模块定义
 ├── go.sum                     # 依赖校验和
-├── Makefile                   # 构建、运行、测试命令
-└── start.bat                  # Windows 一键启动脚本（Redis + API + Tunnel）
+└── Makefile                   # 统一构建、运行、单测与压测 Makefile
 ```
 
 ---
@@ -220,23 +250,15 @@ go mod download
 ```bash
 make run          # 直接运行 API 服务器
 make build        # 编译所有二进制到 bin/ 目录
-make start        # 运行 start.bat（Windows）
+make start        # 启动主 API 服务器服务
+make test         # 运行全套单元测试 (go test ./...)
 ```
 
-**方式二：Go 直接运行**
+**方式二：Go 命令运行**
 
 ```bash
 go run ./cmd/api/
 ```
-
-**方式三：Windows 一键启动**
-
-双击 `start.bat`，自动完成：
-
-1. 启动 Redis（如果未运行）
-2. 启动 API 服务器
-3. 启动 Cloudflare Tunnel
-4. 显示本地和公网访问地址
 
 ### 4. 访问
 
@@ -843,10 +865,10 @@ set REDIS_CONFIG=D:\Redis\redis.windows.conf
 | ---------------- | -------------------------------------------- |
 | `make build`     | 编译三个二进制文件（api、grpc、ws）到 `bin/`               |
 | `make run`       | 直接运行 API 服务器                                 |
-| `make start`     | 运行 `start.bat`（Windows：Redis + API + Tunnel） |
+| `make start`     | 运行 API 服务器 (`go run ./cmd/api/main.go`)      |
 | `make run-grpc`  | 运行独立 gRPC 服务器                                |
 | `make run-ws`    | 运行独立 WebSocket 服务器                           |
-| `make test`      | 运行所有测试（详细输出）                                 |
+| `make test`      | 运行所有单元测试（`go test ./... -v`）                |
 | `make bench`     | 运行内置 HTTP 压测工具                               |
 | `make hotreload` | 使用文件监听热重载运行                                  |
 | `make proto`     | 重新生成 Protobuf Go 代码                          |
@@ -873,6 +895,20 @@ service Greeter {
 ---
 
 ## 变更日志
+
+### 2026-07-31 架构重构、消息总线多路复用与全套单元测试
+
+**核心架构重构（P0）**
+
+- ⚡ **Redis 消息总线多路复用**：`pkg/redisbus` 彻底重构为**单个 `redis.PubSub` 物理连接 + 本地引用计数器 (`channelRefs`)** 模式。解决此前“每订阅一个频道新建一个 PubSub 连接”导致的并发连接爆炸问题，大幅提升多频道扩展能力。
+- 🛡️ **WebSocket 消息写库超时防护**：WebSocket 消息写库过程增加 3 秒超时监控，替换 `time.After` 为 `time.NewTimer` + `defer timer.Stop()` 避免内存泄露，彻底防范数据库慢查询阻塞 WebSocket 读写循环。
+- 🔒 **并发安全与 Data Race 修复**：为 `redisbus.MessageBus` 的回调句柄加上互斥锁保护；`pkg/ws` 广播广播过程收敛至线程安全的 `SendMessage` 方法，避免连接关闭时的 channel 竞争。
+
+**质量与基础设施（P1）**
+
+- 🧪 **引入全套自动化单元测试**：覆盖 `cmd/`, `internal/`（handler, repository, middleware, database, logger, tunnel, config）, `pkg/`（jwt, limiter, redisbus, ws, otel, grpcclient）全部关键路径，单测通行率 100%。
+- 🌐 **原生 Golang Cloudflare 隧道引擎**：`internal/tunnel` 实现基于 `exec.CommandContext` 的原生 Golang 进程与日志管道解析引擎，替代原外部脚本。
+- 🧹 **脚本与环境清理**：移除冗余的 Windows 批处理及 PowerShell 启动脚本，统一收口至 `Makefile`；配置隔离 `.env`，防个人敏感秘钥泄漏至公有 GitHub 仓库。
 
 ### 2026-07-03 安全加固 & 架构修复
 

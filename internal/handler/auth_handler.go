@@ -16,6 +16,12 @@ import (
 	"github.com/example/gin-high-performance/pkg/ws"
 )
 
+var dummyBcryptHash []byte
+
+func init() {
+	dummyBcryptHash, _ = bcrypt.GenerateFromPassword([]byte("dummy_password"), bcrypt.DefaultCost)
+}
+
 var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_\p{Han}]+$`)
 
 type AuthHandler struct {
@@ -53,7 +59,8 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	user, err := h.repo.GetUserByUsername(req.Username)
 	if err != nil || user == nil {
-		bcrypt.CompareHashAndPassword([]byte("$2a$10$0000000000000000000000000000000000000000000000000000"), []byte(req.Password))
+		// 防御计时攻击：使用全局合法的 dummyBcryptHash 模拟完满的计算耗时
+		_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(req.Password))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
@@ -148,8 +155,14 @@ func (h *AuthHandler) ChangePassword(c *gin.Context) {
 		return
 	}
 
-	username, _ := c.Get("username")
-	user, err := h.repo.GetUserByUsername(username.(string))
+	usernameVal, _ := c.Get("username")
+	username, ok := usernameVal.(string)
+	if !ok || username == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
+
+	user, err := h.repo.GetUserByUsername(username)
 	if err != nil || user == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户不存在"})
 		return
@@ -166,9 +179,14 @@ func (h *AuthHandler) ChangePassword(c *gin.Context) {
 		return
 	}
 
-	if err := h.repo.SetPasswordHash(username.(string), string(hash)); err != nil {
+	if err := h.repo.SetPasswordHash(username, string(hash)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "密码修改失败，请重试"})
 		return
+	}
+
+	// 密码修改成功，切断现有 WS 链接提示重新登录
+	if h.hub != nil {
+		h.hub.DisconnectUser(user.ID)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "密码修改成功"})
@@ -195,8 +213,14 @@ func (h *AuthHandler) ChangeUsername(c *gin.Context) {
 		return
 	}
 
-	userID, _ := c.Get("user_id")
-	if err := h.repo.SetUsername(userID.(string), newUsername); err != nil {
+	userIDVal, _ := c.Get("user_id")
+	userID, ok := userIDVal.(string)
+	if !ok || userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
+
+	if err := h.repo.SetUsername(userID, newUsername); err != nil {
 		if errors.Is(err, repository.ErrUserExists) {
 			c.JSON(http.StatusConflict, gin.H{"error": "用户名已被占用"})
 			return
@@ -206,28 +230,31 @@ func (h *AuthHandler) ChangeUsername(c *gin.Context) {
 	}
 
 	// 更新 WebSocket Hub 中的用户名
-	h.hub.UpdateUsername(userID.(string), newUsername)
+	if h.hub != nil {
+		h.hub.UpdateUsername(userID, newUsername)
 
-	// 广播用户名更新事件给所有在线用户
-	updateMsg, _ := json.Marshal(ws.WSMessage{
-		Type:    "username_updated",
-		UserID:  userID.(string),
-		Content: newUsername,
-	})
-	h.hub.Broadcast(updateMsg)
+		if updateMsg, err := json.Marshal(ws.WSMessage{
+			Type:    "username_updated",
+			UserID:  userID,
+			Content: newUsername,
+		}); err == nil {
+			h.hub.Broadcast(updateMsg)
+		}
+	}
 
-	// 生成新 token（包含新用户名）
-	user, _ := h.repo.GetUserByID(userID.(string))
-	if user == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "用户不存在"})
-		return
+	// 优化：优先从 gin.Context 中获取角色，减少查库 IO
+	roleStr := "user"
+	if roleVal, exists := c.Get("role"); exists {
+		if r, ok := roleVal.(string); ok && r != "" {
+			roleStr = r
+		}
 	}
 
 	newToken, err := jwt.GenerateToken(
 		h.cfg.JWTSecret,
-		user.ID,
-		user.Username,
-		user.Role,
+		userID,
+		newUsername,
+		roleStr,
 		h.cfg.JWTExpireHours,
 	)
 	if err != nil {

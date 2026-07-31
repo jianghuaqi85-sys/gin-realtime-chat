@@ -2,6 +2,7 @@ package repository
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,13 @@ type Channel struct {
 }
 
 func (Channel) TableName() string { return "channels" }
+
+func (c *Channel) BeforeCreate(tx *gorm.DB) (err error) {
+	if c.ID == "" {
+		c.ID = uuid.New().String()
+	}
+	return
+}
 
 type ChannelRepository interface {
 	Create(channel *Channel) error
@@ -36,9 +44,6 @@ func NewMySQLChannelRepository(db *gorm.DB) *MySQLChannelRepository {
 }
 
 func (r *MySQLChannelRepository) Create(ch *Channel) error {
-	if ch.ID == "" {
-		ch.ID = uuid.New().String()
-	}
 	return r.db.Create(ch).Error
 }
 
@@ -73,18 +78,26 @@ func (r *MySQLChannelRepository) Count() (int64, error) {
 	return count, err
 }
 
-// Message — 聊天消息
+// Message — 聊天消息 (包含联合索引 idx_channel_created 与 外键级联描述)
 
 type Message struct {
 	ID        string    `gorm:"primaryKey;type:varchar(36)"`
-	ChannelID string    `gorm:"index;type:varchar(36);not null"`
+	ChannelID string    `gorm:"index:idx_channel_created;type:varchar(36);not null;constraint:OnUpdate:CASCADE,OnDelete:CASCADE;"`
 	UserID    string    `gorm:"type:varchar(36);not null"`
 	Username  string    `gorm:"type:varchar(64);not null"`
 	Content   string    `gorm:"type:text;not null"`
-	CreatedAt time.Time `gorm:"index"`
+	CreatedAt time.Time `gorm:"index:idx_channel_created"`
+	UpdatedAt time.Time
 }
 
 func (Message) TableName() string { return "messages" }
+
+func (m *Message) BeforeCreate(tx *gorm.DB) (err error) {
+	if m.ID == "" {
+		m.ID = uuid.New().String()
+	}
+	return
+}
 
 type MessageRepository interface {
 	Create(msg *Message) error
@@ -107,9 +120,6 @@ func NewMySQLMessageRepository(db *gorm.DB) *MySQLMessageRepository {
 }
 
 func (r *MySQLMessageRepository) Create(msg *Message) error {
-	if msg.ID == "" {
-		msg.ID = uuid.New().String()
-	}
 	return r.db.Create(msg).Error
 }
 
@@ -124,9 +134,7 @@ func (r *MySQLMessageRepository) GetByChannel(channelID string, limit int) ([]Me
 		Find(&msgs).Error; err != nil {
 		return nil, err
 	}
-	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
-		msgs[i], msgs[j] = msgs[j], msgs[i]
-	}
+	slices.Reverse(msgs)
 	return msgs, nil
 }
 
@@ -141,9 +149,7 @@ func (r *MySQLMessageRepository) GetByChannelBefore(channelID string, before tim
 		Find(&msgs).Error; err != nil {
 		return nil, err
 	}
-	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
-		msgs[i], msgs[j] = msgs[j], msgs[i]
-	}
+	slices.Reverse(msgs)
 	return msgs, nil
 }
 
@@ -165,7 +171,13 @@ func (r *MySQLMessageRepository) Update(id, content string) error {
 
 func (r *MySQLMessageRepository) DeleteByUser(id, userID string) error {
 	result := r.db.Where("id = ? AND user_id = ?", id, userID).Delete(&Message{})
-	return result.Error
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("message not found or unauthorized")
+	}
+	return nil
 }
 
 func (r *MySQLMessageRepository) Delete(id string) error {

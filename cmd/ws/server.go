@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -22,18 +21,73 @@ import (
 func main() {
 	log.Println("Starting WebSocket server...")
 
+	// 1. 初始化配置与日志
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-
 	logger.Init(cfg.LogLevel)
 
+	// 2. 现代化的信号上下文监听
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// 3. 初始化 Hub
+	hub := ws.NewHub()
+
+	// 4. 注册路由
+	router := setupWSRouter(cfg, hub)
+
+	srv := &http.Server{
+		Addr:    ":" + cfg.WSPort,
+		Handler: router,
+	}
+
+	eg, egCtx := errgroup.WithContext(ctx)
+
+	// 启动 WebSocket 服务
+	eg.Go(func() error {
+		log.Printf("WebSocket server starting on :%s", cfg.WSPort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("ws server listen failed: %w", err)
+		}
+		return nil
+	})
+
+	// 优雅停机逻辑
+	eg.Go(func() error {
+		<-egCtx.Done()
+		log.Println("Received shutdown signal, initiating graceful shutdown...")
+
+		// 关键优化：先切断长连接并通知客户端
+		log.Println("Broadcasting shutdown message and closing WebSocket connections...")
+		hub.BroadcastSystemAll("服务器即将重启维护，请稍后重新连接...")
+		time.Sleep(100 * time.Millisecond)
+		hub.Close()
+
+		// 然后再关闭底层的 HTTP Server
+		log.Println("Shutting down underlying HTTP server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("HTTP server forced to shutdown: %w", err)
+		}
+
+		return nil
+	})
+
+	if err := eg.Wait(); err != nil {
+		log.Printf("WebSocket server error: %v", err)
+	}
+
+	log.Println("WebSocket server successfully exited")
+}
+
+func setupWSRouter(cfg *config.Config, hub *ws.Hub) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
-
-	hub := ws.NewHub()
 
 	router.GET("/ws", func(c *gin.Context) {
 		validateToken := func(token string) (string, string, error) {
@@ -50,47 +104,5 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "ws", "timestamp": time.Now().Unix()})
 	})
 
-	srv := &http.Server{
-		Addr:    ":" + cfg.WSPort,
-		Handler: router,
-	}
-
-	eg, ctx := errgroup.WithContext(context.Background())
-
-	eg.Go(func() error {
-		log.Printf("WebSocket server starting on :%s", cfg.WSPort)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			return fmt.Errorf("ws server listen failed: %w", err)
-		}
-		return nil
-	})
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	eg.Go(func() error {
-		select {
-		case <-quit:
-			log.Println("Received shutdown signal")
-		case <-ctx.Done():
-			log.Println("Context cancelled")
-		}
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		log.Println("Shutting down WebSocket server...")
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("ws server shutdown failed: %w", err)
-		}
-		log.Println("Closing WebSocket hub...")
-		hub.Close()
-		return nil
-	})
-
-	if err := eg.Wait(); err != nil {
-		log.Fatalf("WebSocket server error: %v", err)
-	}
-
-	log.Println("WebSocket server exiting")
+	return router
 }

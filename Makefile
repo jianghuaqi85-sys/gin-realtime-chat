@@ -11,7 +11,7 @@ run:
 	go run ./cmd/api/main.go
 
 start:
-	@./start.bat
+	go run ./cmd/api/main.go
 
 run-grpc:
 	go run ./cmd/grpc/server.go

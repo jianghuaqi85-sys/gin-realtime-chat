@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
@@ -14,16 +15,33 @@ import (
 
 var ErrUserExists = errors.New("user already exists")
 
+type Role string
+
+const (
+	RoleSuperAdmin Role = "super_admin"
+	RoleAdmin      Role = "admin"
+	RoleUser       Role = "user"
+)
+
 type User struct {
-	ID           string `gorm:"primaryKey;type:varchar(36)"`
-	Username     string `gorm:"uniqueIndex;type:varchar(64);not null"`
-	PasswordHash string `gorm:"type:varchar(255);not null"`
-	Role         string `gorm:"type:varchar(16);default:user;not null"` // super_admin / admin / user
-	Banned       bool   `gorm:"default:false;not null"`
+	ID           string    `gorm:"primaryKey;type:varchar(36)"`
+	Username     string    `gorm:"uniqueIndex;type:varchar(64);not null"`
+	PasswordHash string    `gorm:"type:varchar(255);not null"`
+	Role         string    `gorm:"type:varchar(16);default:user;not null"`
+	Banned       bool      `gorm:"default:false;not null"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 func (User) TableName() string {
 	return "users"
+}
+
+func (u *User) BeforeCreate(tx *gorm.DB) (err error) {
+	if u.ID == "" {
+		u.ID = uuid.New().String()
+	}
+	return
 }
 
 type UserRepository interface {
@@ -59,11 +77,14 @@ func (r *InMemoryUserRepository) initDefaultUser() {
 	if err != nil {
 		log.Fatalf("[FATAL] 初始化管理员密码失败: %v", err)
 	}
+	now := time.Now()
 	r.users["admin"] = &User{
 		ID:           "1",
 		Username:     "admin",
 		PasswordHash: string(hash),
-		Role:         "super_admin",
+		Role:         string(RoleSuperAdmin),
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 }
 
@@ -74,7 +95,6 @@ func (r *InMemoryUserRepository) GetUserByUsername(username string) (*User, erro
 	if !ok {
 		return nil, nil
 	}
-	// 返回深拷贝，避免并发修改内部状态
 	cp := *user
 	return &cp, nil
 }
@@ -97,11 +117,14 @@ func (r *InMemoryUserRepository) CreateUser(username, passwordHash string) error
 	if _, ok := r.users[username]; ok {
 		return ErrUserExists
 	}
+	now := time.Now()
 	r.users[username] = &User{
 		ID:           uuid.New().String(),
 		Username:     username,
 		PasswordHash: passwordHash,
-		Role:         "user",
+		Role:         string(RoleUser),
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 	return nil
 }
@@ -114,22 +137,22 @@ func (r *InMemoryUserRepository) SetPasswordHash(username, hash string) error {
 		return fmt.Errorf("user %q not found", username)
 	}
 	user.PasswordHash = hash
+	user.UpdatedAt = time.Now()
 	return nil
 }
 
 func (r *InMemoryUserRepository) SetUsername(userID, newUsername string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// 检查新用户名是否已存在
 	for _, u := range r.users {
 		if u.Username == newUsername && u.ID != userID {
 			return ErrUserExists
 		}
 	}
-	// 找到用户并更新用户名
 	for oldUsername, u := range r.users {
 		if u.ID == userID {
 			u.Username = newUsername
+			u.UpdatedAt = time.Now()
 			r.users[newUsername] = u
 			delete(r.users, oldUsername)
 			return nil
@@ -160,6 +183,7 @@ func (r *InMemoryUserRepository) SetRole(userID, role string) error {
 	for _, u := range r.users {
 		if u.ID == userID {
 			u.Role = role
+			u.UpdatedAt = time.Now()
 			return nil
 		}
 	}
@@ -172,6 +196,7 @@ func (r *InMemoryUserRepository) SetBanned(userID string, banned bool) error {
 	for _, u := range r.users {
 		if u.ID == userID {
 			u.Banned = banned
+			u.UpdatedAt = time.Now()
 			return nil
 		}
 	}
@@ -203,22 +228,22 @@ func NewMySQLUserRepository(db *gorm.DB) *MySQLUserRepository {
 }
 
 func (r *MySQLUserRepository) initDefaultUser() {
-	var count int64
-	r.db.Model(&User{}).Where("username = ?", "admin").Count(&count)
-	if count > 0 {
-		r.db.Model(&User{}).Where("username = ?", "admin").Update("role", "super_admin")
-		return
-	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(getInitialAdminPassword()), bcrypt.DefaultCost)
 	if err != nil {
 		log.Fatalf("[FATAL] 初始化管理员密码失败: %v", err)
 	}
-	r.db.Create(&User{
-		ID:           uuid.New().String(),
-		Username:     "admin",
-		PasswordHash: string(hash),
-		Role:         "super_admin",
-	})
+
+	var user User
+	result := r.db.Where("username = ?", "admin").
+		Attrs(User{
+			PasswordHash: string(hash),
+			Role:         string(RoleSuperAdmin),
+		}).
+		FirstOrCreate(&user)
+
+	if result.RowsAffected == 0 && user.Role != string(RoleSuperAdmin) {
+		r.db.Model(&user).Update("role", string(RoleSuperAdmin))
+	}
 }
 
 func (r *MySQLUserRepository) GetUserByUsername(username string) (*User, error) {
@@ -246,17 +271,15 @@ func (r *MySQLUserRepository) GetUserByID(id string) (*User, error) {
 }
 
 func (r *MySQLUserRepository) CreateUser(username, passwordHash string) error {
-	var count int64
-	r.db.Model(&User{}).Where("username = ?", username).Count(&count)
-	if count > 0 {
-		return ErrUserExists
-	}
-	return r.db.Create(&User{
-		ID:           uuid.New().String(),
+	err := r.db.Create(&User{
 		Username:     username,
 		PasswordHash: passwordHash,
-		Role:         "user",
+		Role:         string(RoleUser),
 	}).Error
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return ErrUserExists
+	}
+	return err
 }
 
 func (r *MySQLUserRepository) SetPasswordHash(username, hash string) error {
@@ -268,28 +291,23 @@ func (r *MySQLUserRepository) SetPasswordHash(username, hash string) error {
 }
 
 func (r *MySQLUserRepository) SetUsername(userID, newUsername string) error {
-	// 检查新用户名是否已存在
-	var count int64
-	r.db.Model(&User{}).Where("username = ? AND id != ?", newUsername, userID).Count(&count)
-	if count > 0 {
-		return ErrUserExists
-	}
 	return r.db.Transaction(func(tx *gorm.DB) error {
-		// 获取旧用户名
 		var user User
 		if err := tx.Where("id = ?", userID).First(&user).Error; err != nil {
 			return fmt.Errorf("user %q not found", userID)
 		}
 		oldUsername := user.Username
-		// 更新用户表中的用户名
-		if err := tx.Model(&User{}).Where("id = ?", userID).Update("username", newUsername).Error; err != nil {
+
+		err := tx.Model(&User{}).Where("id = ?", userID).Update("username", newUsername).Error
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return ErrUserExists
+		} else if err != nil {
 			return err
 		}
-		// 更新所有历史消息中的用户名（同一事务保证一致性）
+
 		return tx.Model(&Message{}).Where("username = ?", oldUsername).Update("username", newUsername).Error
 	})
 }
-
 
 func (r *MySQLUserRepository) List() ([]User, error) {
 	var users []User
@@ -329,8 +347,6 @@ func (r *MySQLUserRepository) Delete(userID string) error {
 	return result.Error
 }
 
-// getInitialAdminPassword 从环境变量 ADMIN_INITIAL_PASSWORD 读取初始管理员密码。
-// 未设置时回退到默认值并打印醒目警告，提示尽快在首次登录后修改密码。
 func getInitialAdminPassword() string {
 	if pwd := os.Getenv("ADMIN_INITIAL_PASSWORD"); pwd != "" {
 		return pwd
@@ -338,4 +354,3 @@ func getInitialAdminPassword() string {
 	log.Println("[WARN] ADMIN_INITIAL_PASSWORD 未设置，使用默认密码 'admin123'。请登录后立即修改！")
 	return "admin123"
 }
-

@@ -1,21 +1,24 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/spf13/viper"
 )
 
 type Config struct {
 	// App
-	AppEnv    string `mapstructure:"app_env"`
-	AppPort   string `mapstructure:"app_port"`
-	GRPCPort  string `mapstructure:"grpc_port"`
-	WSPort    string `mapstructure:"ws_port"`
+	AppEnv   string `mapstructure:"app_env"`
+	AppPort  string `mapstructure:"app_port"`
+	GRPCPort string `mapstructure:"grpc_port"`
+	WSPort   string `mapstructure:"ws_port"`
 
 	// JWT
-	JWTSecret     string `mapstructure:"jwt_secret"`
-	JWTExpireHours int   `mapstructure:"jwt_expire_hours"`
+	JWTSecret      string `mapstructure:"jwt_secret"`
+	JWTExpireHours int    `mapstructure:"jwt_expire_hours"`
 
 	// Redis
 	RedisAddr     string `mapstructure:"redis_addr"`
@@ -30,9 +33,7 @@ type Config struct {
 	OtelInsecure bool   `mapstructure:"otel_insecure"`
 
 	// Log
-	LogLevel string `mapstructure:"log_level"`
-
-	// DB Log
+	LogLevel   string `mapstructure:"log_level"`
 	DBLogLevel string `mapstructure:"db_log_level"`
 
 	// WebSocket
@@ -44,12 +45,25 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
-	viper.AutomaticEnv()
-	viper.SetConfigFile(".env")
+	viper.Reset()
 
-	_ = viper.ReadInConfig()
+	viper.SetConfigName(".env")
+	viper.SetConfigType("env")
+	viper.AddConfigPath(".")
+	viper.AddConfigPath("../")
+	viper.AddConfigPath("../../")
+
+	viper.AutomaticEnv()
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 
 	setDefaults()
+
+	if err := viper.ReadInConfig(); err != nil {
+		var configFileNotFoundError viper.ConfigFileNotFoundError
+		if !errors.As(err, &configFileNotFoundError) && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("failed to parse config file: %w", err)
+		}
+	}
 
 	var config Config
 	if err := viper.Unmarshal(&config); err != nil {
@@ -70,12 +84,15 @@ func setDefaults() {
 	viper.SetDefault("app_env", "development")
 	viper.SetDefault("jwt_expire_hours", 24)
 	viper.SetDefault("redis_addr", "localhost:6379")
-	viper.SetDefault("log_level", "info")
-	viper.SetDefault("ws_read_limit", 512)
+	viper.SetDefault("redis_password", "")
+	viper.SetDefault("redis_db", 0)
 	viper.SetDefault("mysql_dsn", "")
+	viper.SetDefault("log_level", "info")
+	viper.SetDefault("db_log_level", "warn")
+	viper.SetDefault("ws_allowed_origin", "")
+	viper.SetDefault("ws_read_limit", 512)
 	viper.SetDefault("otel_endpoint", "")
 	viper.SetDefault("otel_insecure", true)
-	viper.SetDefault("db_log_level", "warn")
 	viper.SetDefault("cloudflared_path", "")
 }
 
@@ -84,7 +101,17 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("JWT_SECRET is required and must not be empty")
 	}
 	if len(cfg.JWTSecret) < 32 {
-		return fmt.Errorf("JWT_SECRET must be at least 32 characters")
+		return fmt.Errorf("JWT_SECRET must be at least 32 characters (current: %d)", len(cfg.JWTSecret))
 	}
+
+	if cfg.AppEnv == "production" {
+		if cfg.MySQLDSN == "" {
+			return fmt.Errorf("MYSQL_DSN is required in production environment")
+		}
+		if cfg.RedisPassword == "" {
+			return fmt.Errorf("REDIS_PASSWORD should not be empty in production")
+		}
+	}
+
 	return nil
 }

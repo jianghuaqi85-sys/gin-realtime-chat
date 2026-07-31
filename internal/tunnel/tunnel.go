@@ -2,6 +2,8 @@ package tunnel
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -14,69 +16,108 @@ import (
 var urlRegex = regexp.MustCompile(`https://[a-zA-Z0-9\-]+\.trycloudflare\.com`)
 
 type Manager struct {
-	cmd     *exec.Cmd
-	url     string
-	mu      sync.RWMutex
-	urlFile string
+	cloudflaredPath string
+	port            string
+	urlFile         string
+
+	cmd    *exec.Cmd
+	cancel context.CancelFunc // 用于优雅取消进程
+	url    string
+	mu     sync.RWMutex
 }
 
 // NewManager 创建隧道管理器
-// cloudflaredPath: cloudflared 可执行文件路径
-// port: 本地服务端口
-// urlFile: 保存 URL 的文件路径
 func NewManager(cloudflaredPath, port, urlFile string) *Manager {
 	return &Manager{
-		cmd:     exec.Command(cloudflaredPath, "tunnel", "--url", "http://localhost:"+port),
-		urlFile: urlFile,
+		cloudflaredPath: cloudflaredPath,
+		port:            port,
+		urlFile:         urlFile,
 	}
 }
 
-// Start 启动 Cloudflare Tunnel 并捕获 URL
-func (m *Manager) Start() error {
+// Start 启动 Cloudflare Tunnel 并阻塞等待 URL 就绪
+func (m *Manager) Start(ctxs ...context.Context) error {
+	ctx := context.Background()
+	if len(ctxs) > 0 && ctxs[0] != nil {
+		ctx = ctxs[0]
+	}
+
+	m.mu.Lock()
+	if m.cmd != nil {
+		m.mu.Unlock()
+		return errors.New("tunnel 已经启动")
+	}
+
+	cmdCtx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+	m.cmd = exec.CommandContext(cmdCtx, m.cloudflaredPath, "tunnel", "--url", "http://localhost:"+m.port)
+	m.mu.Unlock()
+
 	stderr, err := m.cmd.StderrPipe()
 	if err != nil {
+		m.Stop()
 		return fmt.Errorf("创建 stderr pipe 失败: %w", err)
 	}
 
 	if err := m.cmd.Start(); err != nil {
+		m.Stop()
 		return fmt.Errorf("启动 cloudflared 失败: %w", err)
 	}
 
-	// 从 stderr 读取输出，捕获 URL
+	urlReady := make(chan struct{})
+	processExit := make(chan error, 1)
+
+	// 1. 扫描日志的 Goroutine
 	go func() {
 		scanner := bufio.NewScanner(stderr)
+		var once sync.Once
 		for scanner.Scan() {
 			line := scanner.Text()
 
-			// 检测 URL
 			if match := urlRegex.FindString(line); match != "" {
-				m.mu.Lock()
-				m.url = match
-				m.mu.Unlock()
+				once.Do(func() {
+					m.mu.Lock()
+					m.url = match
+					m.mu.Unlock()
 
-				// 保存到文件
-				if err := os.WriteFile(m.urlFile, []byte(match), 0644); err != nil {
-					log.Printf("[WARN] 保存隧道 URL 失败: %v", err)
-				} else {
-					log.Printf("Cloudflare Tunnel 地址: %s", match)
-				}
+					if err := os.WriteFile(m.urlFile, []byte(match), 0644); err != nil {
+						log.Printf("[WARN] 保存隧道 URL 失败: %v", err)
+					} else {
+						log.Printf("Cloudflare Tunnel 地址就绪: %s", match)
+					}
+					close(urlReady)
+				})
 			}
 
-			// 输出 cloudflared 日志
 			if strings.Contains(line, "ERR") || strings.Contains(line, "error") {
 				log.Printf("[cloudflared] %s", line)
 			}
 		}
-	}()
-
-	// 等待进程结束
-	go func() {
-		if err := m.cmd.Wait(); err != nil {
-			log.Printf("[WARN] cloudflared 进程退出: %v", err)
+		if err := scanner.Err(); err != nil {
+			log.Printf("[WARN] 读取 cloudflared 日志中断: %v", err)
 		}
 	}()
 
-	return nil
+	// 2. 监控进程退出的 Goroutine
+	go func() {
+		err := m.cmd.Wait()
+		processExit <- err
+	}()
+
+	// 3. 阻塞等待：URL 就绪 / 进程崩溃 / 超时
+	select {
+	case <-urlReady:
+		return nil
+	case err := <-processExit:
+		m.Stop()
+		if err != nil {
+			return fmt.Errorf("cloudflared 进程异常退出: %w", err)
+		}
+		return errors.New("cloudflared 退出且未生成 URL")
+	case <-ctx.Done():
+		m.Stop()
+		return fmt.Errorf("等待隧道启动超时或被取消: %w", ctx.Err())
+	}
 }
 
 // GetURL 获取当前隧道 URL
@@ -86,11 +127,17 @@ func (m *Manager) GetURL() string {
 	return m.url
 }
 
-// Stop 停止隧道
+// Stop 优雅停止隧道
 func (m *Manager) Stop() {
-	if m.cmd != nil && m.cmd.Process != nil {
-		m.cmd.Process.Kill()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
 	}
-	// 清理 URL 文件
-	os.Remove(m.urlFile)
+	m.cmd = nil
+	m.url = ""
+
+	_ = os.Remove(m.urlFile)
 }

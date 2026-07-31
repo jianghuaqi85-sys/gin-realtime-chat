@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -13,7 +15,10 @@ import (
 	"github.com/example/gin-high-performance/pkg/ws"
 )
 
-const MaxMessageLength = 4096
+const (
+	MaxMessageLength  = 4096 // 单条消息最大字符数
+	MaxChannelNameLen = 32   // 频道名称最大字符数
+)
 
 type ChatHandler struct {
 	channelRepo repository.ChannelRepository
@@ -31,13 +36,17 @@ func NewChatHandler(channelRepo repository.ChannelRepository, messageRepo reposi
 	}
 }
 
-
 type CreateChannelRequest struct {
 	Name string `json:"name" binding:"required"`
 }
 
 func (h *ChatHandler) CreateChannel(c *gin.Context) {
-	userID := c.MustGet("user_id").(string)
+	userIDVal, exists := c.Get("user_id")
+	userID, ok := userIDVal.(string)
+	if !exists || !ok || userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
 
 	var req CreateChannelRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -45,28 +54,47 @@ func (h *ChatHandler) CreateChannel(c *gin.Context) {
 		return
 	}
 
+	// 防御性编程：限制频道名称长度
+	if utf8.RuneCountInString(req.Name) > MaxChannelNameLen {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "频道名称过长，最多 32 个字符"})
+		return
+	}
+
 	ch := &repository.Channel{
 		Name:      req.Name,
 		CreatedBy: userID,
 	}
+
+	if h.channelRepo == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "repository not initialized"})
+		return
+	}
+
 	if err := h.channelRepo.Create(ch); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建频道失败"})
 		return
 	}
 
 	// 广播频道创建事件给所有在线用户
-	chMsg, _ := json.Marshal(ws.WSMessage{
-		Type:      "channel_created",
-		ChannelID: ch.ID,
-		Content:   ch.Name,
-		CreatedAt: ch.CreatedAt.Format(time.RFC3339),
-	})
-	h.hub.Broadcast(chMsg)
+	if h.hub != nil {
+		if chMsg, err := json.Marshal(ws.WSMessage{
+			Type:      "channel_created",
+			ChannelID: ch.ID,
+			Content:   ch.Name,
+			CreatedAt: ch.CreatedAt.Format(time.RFC3339),
+		}); err == nil {
+			h.hub.Broadcast(chMsg)
+		}
+	}
 
 	c.JSON(http.StatusCreated, ch)
 }
 
 func (h *ChatHandler) ListChannels(c *gin.Context) {
+	if h.channelRepo == nil {
+		c.JSON(http.StatusOK, []interface{}{})
+		return
+	}
 	channels, err := h.channelRepo.List()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取频道列表失败"})
@@ -86,6 +114,11 @@ func (h *ChatHandler) GetMessages(c *gin.Context) {
 		limit = 200
 	}
 	before := c.Query("before")
+
+	if h.messageRepo == nil {
+		c.JSON(http.StatusOK, []interface{}{})
+		return
+	}
 
 	var msgs []repository.Message
 	var err error
@@ -107,7 +140,12 @@ func (h *ChatHandler) GetMessages(c *gin.Context) {
 }
 
 func (h *ChatHandler) EditMessage(c *gin.Context) {
-	userID := c.MustGet("user_id").(string)
+	userIDVal, _ := c.Get("user_id")
+	userID, ok := userIDVal.(string)
+	if !ok || userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
 	msgID := c.Param("id")
 
 	var req struct {
@@ -118,9 +156,18 @@ func (h *ChatHandler) EditMessage(c *gin.Context) {
 		return
 	}
 
-	// 先获取消息，校验归属权
+	if utf8.RuneCountInString(req.Content) > MaxMessageLength {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "消息内容过长，最多 4096 个字符"})
+		return
+	}
+
+	if h.messageRepo == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "repository not initialized"})
+		return
+	}
+
 	msg, err := h.messageRepo.GetByID(msgID)
-	if err != nil {
+	if err != nil || msg == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "消息不存在"})
 		return
 	}
@@ -134,25 +181,36 @@ func (h *ChatHandler) EditMessage(c *gin.Context) {
 		return
 	}
 
-	// 广播消息编辑事件到消息所属频道
-	editMsg, _ := json.Marshal(ws.WSMessage{
-		Type:      "message_edited",
-		ChannelID: msg.ChannelID,
-		UserID:    userID,
-		Content:   req.Content,
-	})
-	h.hub.BroadcastToChannel(msg.ChannelID, editMsg)
+	if h.hub != nil {
+		if editMsg, err := json.Marshal(ws.WSMessage{
+			Type:      "message_edited",
+			ChannelID: msg.ChannelID,
+			UserID:    userID,
+			Content:   req.Content,
+		}); err == nil {
+			h.hub.BroadcastToChannel(msg.ChannelID, editMsg)
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "编辑成功"})
 }
 
 func (h *ChatHandler) DeleteMyMessage(c *gin.Context) {
-	userID := c.MustGet("user_id").(string)
+	userIDVal, _ := c.Get("user_id")
+	userID, ok := userIDVal.(string)
+	if !ok || userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
 	msgID := c.Param("id")
 
-	// 先获取消息信息，以便广播到正确的频道
+	if h.messageRepo == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "repository not initialized"})
+		return
+	}
+
 	msg, err := h.messageRepo.GetByID(msgID)
-	if err != nil {
+	if err != nil || msg == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "消息不存在"})
 		return
 	}
@@ -162,18 +220,20 @@ func (h *ChatHandler) DeleteMyMessage(c *gin.Context) {
 		return
 	}
 
-	// 广播消息删除事件到消息所属频道
-	deleteMsg, _ := json.Marshal(ws.WSMessage{
-		Type:      "message_deleted",
-		ChannelID: msg.ChannelID,
-		Content:   msgID,
-	})
-	h.hub.BroadcastToChannel(msg.ChannelID, deleteMsg)
+	if h.hub != nil {
+		if deleteMsg, err := json.Marshal(ws.WSMessage{
+			Type:      "message_deleted",
+			ChannelID: msg.ChannelID,
+			Content:   msgID,
+		}); err == nil {
+			h.hub.BroadcastToChannel(msg.ChannelID, deleteMsg)
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
 }
 
-// OnWSMessage — 先同步持久化获取消息 ID，再广播
+// OnWSMessage — 先同步持久化获取消息 ID，再广播 (带有 3s DB 探活超时防护)
 func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 	var msg ws.WSMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
@@ -181,7 +241,7 @@ func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 	}
 
 	// 消息长度限制，防止内存耗尽攻击
-	if len(msg.Content) > MaxMessageLength {
+	if utf8.RuneCountInString(msg.Content) > MaxMessageLength {
 		errMsg, _ := json.Marshal(ws.WSMessage{
 			Type:    "error",
 			Content: "消息内容过长，最多 4096 个字符",
@@ -199,15 +259,44 @@ func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 		return
 	}
 
-	// 先同步持久化到数据库，获取消息 ID
 	dbMsg := &repository.Message{
 		ChannelID: msg.ChannelID,
 		UserID:    client.GetUserID(),
 		Username:  client.GetUsername(),
 		Content:   msg.Content,
 	}
-	if err := h.messageRepo.Create(dbMsg); err != nil {
-		log.Printf("[WARN] 消息持久化失败: %v (channel=%s, user=%s)", err, msg.ChannelID, client.GetUsername())
+
+	// 核心防护：设置 3s 超时防慢查询卡死 WS 读循环
+	done := make(chan error, 1)
+	go func() {
+		if h.messageRepo != nil {
+			done <- h.messageRepo.Create(dbMsg)
+		} else {
+			done <- nil
+		}
+	}()
+
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("[WARN] 消息持久化失败: %v (channel=%s, user=%s)", err, msg.ChannelID, client.GetUsername())
+			errMsg, _ := json.Marshal(ws.WSMessage{
+				Type:    "error",
+				Content: "发送失败，服务器繁忙",
+			})
+			client.SendMessage(errMsg)
+			return
+		}
+	case <-timer.C:
+		log.Printf("[WARN] 消息持久化超时 (channel=%s, user=%s)", msg.ChannelID, client.GetUsername())
+		errMsg, _ := json.Marshal(ws.WSMessage{
+			Type:    "error",
+			Content: "发送超时，请重试",
+		})
+		client.SendMessage(errMsg)
 		return
 	}
 
@@ -223,10 +312,13 @@ func (h *ChatHandler) OnWSMessage(client *ws.Client, data []byte) {
 		MessageID: dbMsg.ID,
 	})
 
-	// 通过 Redis Pub/Sub 发布（多实例广播）或直接本地广播（单实例）
 	if h.bus != nil {
-		h.bus.Publish(msg.ChannelID, outMsg)
-	} else {
+		pubCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := h.bus.Publish(pubCtx, msg.ChannelID, outMsg); err != nil {
+			log.Printf("[WARN] 发布消息到 Redis 消息总线失败: %v (channel=%s)", err, msg.ChannelID)
+		}
+		cancel()
+	} else if h.hub != nil {
 		h.hub.BroadcastToChannel(msg.ChannelID, outMsg)
 	}
 }

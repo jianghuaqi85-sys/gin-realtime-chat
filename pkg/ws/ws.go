@@ -1,9 +1,11 @@
 package ws
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -25,8 +27,7 @@ const (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	// CheckOrigin 统一由 ServeWS 中的 checkOrigin() 负责，Upgrader 层不再重复检查
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
 // WSMessage — WebSocket JSON 消息协议
@@ -52,12 +53,33 @@ type Client struct {
 	channels      map[string]bool
 	mu            sync.Mutex
 	authenticated bool
+	stopCh        chan struct{}
+	closeOnce     sync.Once
 }
 
 func (c *Client) GetUserID() string   { return c.userID }
 func (c *Client) GetUsername() string { return c.username }
 
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		if c.stopCh != nil {
+			close(c.stopCh)
+		}
+		if c.conn != nil {
+			c.conn.Close()
+		}
+	})
+}
+
 func (c *Client) SendMessage(msg []byte) {
+	if c.stopCh != nil {
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
+	}
+
 	select {
 	case c.send <- msg:
 	default:
@@ -87,6 +109,7 @@ type Bucket struct {
 	broadcast  chan []byte
 	register   chan *Client
 	unregister chan *Client
+	stopCh     chan struct{}
 	mu         sync.RWMutex
 }
 
@@ -95,6 +118,7 @@ func newBucket() *Bucket {
 		broadcast:  make(chan []byte, 2048),
 		register:   make(chan *Client, 64),
 		unregister: make(chan *Client, 64),
+		stopCh:     make(chan struct{}),
 		clients:    make(map[*Client]bool),
 	}
 }
@@ -102,6 +126,8 @@ func newBucket() *Bucket {
 func (b *Bucket) Run() {
 	for {
 		select {
+		case <-b.stopCh:
+			return
 		case client := <-b.register:
 			b.mu.Lock()
 			b.clients[client] = true
@@ -110,7 +136,7 @@ func (b *Bucket) Run() {
 			b.mu.Lock()
 			if _, ok := b.clients[client]; ok {
 				delete(b.clients, client)
-				close(client.send)
+				client.Close()
 			}
 			b.mu.Unlock()
 		case message := <-b.broadcast:
@@ -118,6 +144,8 @@ func (b *Bucket) Run() {
 			b.mu.RLock()
 			for client := range b.clients {
 				select {
+				case <-client.stopCh:
+					stale = append(stale, client)
 				case client.send <- message:
 				default:
 					stale = append(stale, client)
@@ -129,7 +157,7 @@ func (b *Bucket) Run() {
 				for _, client := range stale {
 					if _, ok := b.clients[client]; ok {
 						delete(b.clients, client)
-						close(client.send)
+						client.Close()
 					}
 				}
 				b.mu.Unlock()
@@ -146,10 +174,10 @@ type channelShard struct {
 
 // MessageBus 跨进程消息总线接口
 type MessageBus interface {
-	Publish(channelID string, data []byte) error
-	Subscribe(channelID string)
-	Unsubscribe(channelID string)
-	Close()
+	Publish(ctx context.Context, channelID string, data []byte) error
+	Subscribe(channelID string) error
+	Unsubscribe(channelID string) error
+	Close() error
 	SetOnMessage(handler func(channelID string, data []byte))
 }
 
@@ -158,15 +186,12 @@ type Hub struct {
 	shards    []*channelShard
 	OnMessage func(client *Client, data []byte)
 	bus       MessageBus
-	localSubs map[string]int // channelID -> 本地客户端计数
-	mu        sync.Mutex     // 保护 localSubs
 }
 
 func NewHub() *Hub {
 	h := &Hub{
-		buckets:   make([]*Bucket, numBuckets),
-		shards:    make([]*channelShard, numChannelShards),
-		localSubs: make(map[string]int),
+		buckets: make([]*Bucket, numBuckets),
+		shards:  make([]*channelShard, numChannelShards),
 	}
 	for i := 0; i < numBuckets; i++ {
 		h.buckets[i] = newBucket()
@@ -200,9 +225,17 @@ func (h *Hub) Register(client *Client) {
 	bucket.register <- client
 }
 
+// Unregister 优化锁获取顺序，消除嵌套持锁倒置风险
 func (h *Hub) Unregister(client *Client) {
 	client.mu.Lock()
+	channelsToLeave := make([]string, 0, len(client.channels))
 	for chID := range client.channels {
+		channelsToLeave = append(channelsToLeave, chID)
+	}
+	client.channels = make(map[string]bool)
+	client.mu.Unlock()
+
+	for _, chID := range channelsToLeave {
 		shard := h.getChannelShard(chID)
 		shard.mu.Lock()
 		if clients, ok := shard.channels[chID]; ok {
@@ -212,9 +245,11 @@ func (h *Hub) Unregister(client *Client) {
 			}
 		}
 		shard.mu.Unlock()
+
+		if h.bus != nil {
+			_ = h.bus.Unsubscribe(chID)
+		}
 	}
-	client.channels = make(map[string]bool)
-	client.mu.Unlock()
 
 	if client.bucket != nil {
 		client.bucket.unregister <- client
@@ -239,14 +274,8 @@ func (h *Hub) JoinChannel(client *Client, channelID string) {
 	shard.mu.Unlock()
 	client.JoinChannel(channelID)
 
-	// 管理 Redis 订阅计数
 	if h.bus != nil {
-		h.mu.Lock()
-		h.localSubs[channelID]++
-		if h.localSubs[channelID] == 1 {
-			h.bus.Subscribe(channelID)
-		}
-		h.mu.Unlock()
+		_ = h.bus.Subscribe(channelID)
 	}
 }
 
@@ -262,15 +291,8 @@ func (h *Hub) LeaveChannel(client *Client, channelID string) {
 	shard.mu.Unlock()
 	client.LeaveChannel(channelID)
 
-	// 管理 Redis 订阅计数
 	if h.bus != nil {
-		h.mu.Lock()
-		h.localSubs[channelID]--
-		if h.localSubs[channelID] <= 0 {
-			delete(h.localSubs, channelID)
-			h.bus.Unsubscribe(channelID)
-		}
-		h.mu.Unlock()
+		_ = h.bus.Unsubscribe(channelID)
 	}
 }
 
@@ -289,7 +311,6 @@ func (h *Hub) BroadcastToChannel(channelID string, msg []byte) {
 	}
 	shard.mu.RUnlock()
 
-	// 按桶分组，利用桶的 goroutine 并行投递
 	bucketGroups := make(map[*Bucket][]*Client)
 	for _, c := range targets {
 		if c.bucket != nil {
@@ -299,10 +320,7 @@ func (h *Hub) BroadcastToChannel(channelID string, msg []byte) {
 	for bucket, group := range bucketGroups {
 		bucket.mu.RLock()
 		for _, c := range group {
-			select {
-			case c.send <- msg:
-			default:
-			}
+			c.SendMessage(msg)
 		}
 		bucket.mu.RUnlock()
 	}
@@ -320,12 +338,13 @@ func (h *Hub) Broadcast(msg []byte) error {
 
 func (h *Hub) Close() {
 	if h.bus != nil {
-		h.bus.Close()
+		_ = h.bus.Close()
 	}
 	for _, bucket := range h.buckets {
+		close(bucket.stopCh)
 		bucket.mu.Lock()
 		for client := range bucket.clients {
-			close(client.send)
+			client.Close()
 			delete(bucket.clients, client)
 		}
 		bucket.mu.Unlock()
@@ -366,15 +385,20 @@ func (h *Hub) OnlineUsers() []OnlineUser {
 func (h *Hub) DisconnectUser(userID string) int {
 	count := 0
 	bucket := h.getBucket(userID)
+	var targets []*Client
 	bucket.mu.Lock()
 	for client := range bucket.clients {
 		if client.userID == userID {
-			close(client.send)
+			targets = append(targets, client)
 			delete(bucket.clients, client)
 			count++
 		}
 	}
 	bucket.mu.Unlock()
+
+	for _, client := range targets {
+		client.Close()
+	}
 	return count
 }
 
@@ -398,6 +422,13 @@ func (h *Hub) BroadcastSystemAll(content string) {
 	for _, bucket := range h.buckets {
 		bucket.mu.RLock()
 		for client := range bucket.clients {
+			if client.stopCh != nil {
+				select {
+				case <-client.stopCh:
+					continue
+				default:
+				}
+			}
 			select {
 			case client.send <- msg:
 			default:
@@ -416,7 +447,7 @@ func (h *Hub) getBucket(userID string) *Bucket {
 func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.Unregister(c)
-		c.conn.Close()
+		c.Close()
 	}()
 
 	c.conn.SetReadLimit(c.readLimit)
@@ -426,6 +457,7 @@ func (c *Client) ReadPump() {
 		return nil
 	})
 
+	errCount := 0
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
@@ -434,8 +466,14 @@ func (c *Client) ReadPump() {
 
 		var msg WSMessage
 		if err := json.Unmarshal(raw, &msg); err != nil {
+			errCount++
+			if errCount >= 5 {
+				log.Printf("[WARN] 客户端 %s 连续发送非法 JSON，强制断开", c.userID)
+				break
+			}
 			continue
 		}
+		errCount = 0
 
 		switch msg.Type {
 		case "join":
@@ -477,7 +515,7 @@ func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		c.conn.Close()
+		c.Close()
 	}()
 
 	for {
@@ -491,6 +529,8 @@ func (c *Client) WritePump() {
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
+		case <-c.stopCh:
+			return
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -524,6 +564,7 @@ func ServeWS(hub *Hub, origin string, readLimit int, validateToken TokenValidato
 		readLimit:     int64(readLimit),
 		channels:      make(map[string]bool),
 		authenticated: false,
+		stopCh:        make(chan struct{}),
 	}
 
 	if err := client.authenticate(validateToken); err != nil {
@@ -584,34 +625,26 @@ func (c *Client) authenticate(validateToken TokenValidator) error {
 func checkOrigin(allowedOrigin string, r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 
-	// 开发环境：允许所有请求（方便调试）
 	if os.Getenv("APP_ENV") != "production" {
 		return true
 	}
 
-	// 生产环境：不允许空 Origin
 	if origin == "" {
 		return false
 	}
 
-	// 如果配置了允许的 Origin，精确匹配
 	if allowedOrigin != "" {
 		return origin == allowedOrigin
 	}
 
-	// 默认：检查 Origin 是否与 Host 匹配（防止跨站 WebSocket 劫持）
 	host := r.Host
-	// 移除端口号（如果有）
 	if idx := strings.Index(host, ":"); idx > 0 {
 		host = host[:idx]
 	}
 
-	// 提取 Origin 的主机部分
 	originHost := origin
-	// 移除协议前缀
 	originHost = strings.TrimPrefix(originHost, "http://")
 	originHost = strings.TrimPrefix(originHost, "https://")
-	// 移除端口号和路径
 	if idx := strings.Index(originHost, ":"); idx > 0 {
 		originHost = originHost[:idx]
 	}

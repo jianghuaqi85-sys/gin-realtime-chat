@@ -1,9 +1,11 @@
 package logger
 
 import (
+	"context"
 	"os"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var log *logrus.Logger
@@ -20,56 +22,96 @@ func Init(level string) {
 		logLevel = logrus.InfoLevel
 	}
 	log.SetLevel(logLevel)
+
+	if logLevel >= logrus.DebugLevel {
+		log.SetReportCaller(true)
+	}
 }
 
 func Get() *logrus.Logger {
+	if log == nil {
+		Init("info")
+	}
 	return log
 }
 
+// Ctx 提取 Context 中的 OpenTelemetry TraceID/SpanID
+func Ctx(ctx context.Context) *logrus.Entry {
+	l := Get()
+	entry := l.WithContext(ctx)
+
+	if ctx == nil {
+		return entry
+	}
+
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.HasTraceID() {
+		entry = entry.WithField("trace_id", spanCtx.TraceID().String())
+	}
+	if spanCtx.HasSpanID() {
+		entry = entry.WithField("span_id", spanCtx.SpanID().String())
+	}
+
+	return entry
+}
+
+// WithFields 链式调用入口
+func WithFields(fields logrus.Fields) *logrus.Entry {
+	return Get().WithFields(fields)
+}
+
 func Trace(msg string, fields ...logrus.Fields) {
-	if fields != nil {
-		log.WithFields(fields[0]).Trace(msg)
+	if len(fields) > 0 {
+		Get().WithFields(fields[0]).Trace(msg)
 	} else {
-		log.Trace(msg)
+		Get().Trace(msg)
 	}
 }
 
 func Debug(msg string, fields ...logrus.Fields) {
-	if fields != nil {
-		log.WithFields(fields[0]).Debug(msg)
+	if len(fields) > 0 {
+		Get().WithFields(fields[0]).Debug(msg)
 	} else {
-		log.Debug(msg)
+		Get().Debug(msg)
 	}
 }
 
 func Info(msg string, fields ...logrus.Fields) {
-	if fields != nil {
-		log.WithFields(fields[0]).Info(msg)
+	if len(fields) > 0 {
+		Get().WithFields(fields[0]).Info(msg)
 	} else {
-		log.Info(msg)
+		Get().Info(msg)
 	}
 }
 
 func Warn(msg string, fields ...logrus.Fields) {
-	if fields != nil {
-		log.WithFields(fields[0]).Warn(msg)
+	if len(fields) > 0 {
+		Get().WithFields(fields[0]).Warn(msg)
 	} else {
-		log.Warn(msg)
+		Get().Warn(msg)
 	}
 }
 
 func Error(msg string, err error, fields ...logrus.Fields) {
-	if fields != nil {
-		log.WithFields(fields[0]).WithError(err).Error(msg)
+	entry := Get().WithError(err)
+	if len(fields) > 0 {
+		entry = entry.WithFields(fields[0])
+	}
+	if err != nil {
+		entry.Error(msg)
 	} else {
-		log.WithError(err).Error(msg)
+		Get().Error(msg)
 	}
 }
 
 func Fatal(msg string, err error, fields ...logrus.Fields) {
-	if fields != nil {
-		log.WithFields(fields[0]).WithError(err).Fatal(msg)
+	entry := Get().WithError(err)
+	if len(fields) > 0 {
+		entry = entry.WithFields(fields[0])
+	}
+	if err != nil {
+		entry.Fatal(msg)
 	} else {
-		log.WithError(err).Fatal(msg)
+		Get().Fatal(msg)
 	}
 }

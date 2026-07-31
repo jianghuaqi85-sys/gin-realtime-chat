@@ -1682,7 +1682,7 @@ function sendMessage(){
   input.focus();
 }
 
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function esc(s){if(!s)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 
 // ===== 管理面板 =====
 function toggleAdmin(){
@@ -1988,7 +1988,8 @@ function showMsgActions(rowEl,msgId,msgUserId){
 // ===== 消息编辑/删除 =====
 async function editMsg(btn,msgId){
   const bubble=btn.closest('.bubble');
-  const oldContent=bubble.textContent.replace('编辑删除','').trim();
+  const firstChild=bubble.childNodes[0];
+  const oldContent=(firstChild&&firstChild.nodeType===3)?firstChild.textContent.trim():bubble.textContent.replace(/编辑|删除/g,'').trim();
   const newContent=prompt('编辑消息:',oldContent);
   if(!newContent||newContent===oldContent)return;
   try{

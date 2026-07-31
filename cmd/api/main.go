@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -32,57 +31,73 @@ import (
 func main() {
 	log.Println("Starting API server...")
 
+	// 1. 初始化配置与日志
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-
 	logger.Init(cfg.LogLevel)
 
-	shutdownTracer, err := otel.InitTracer(cfg.OtelEndpoint, cfg.OtelInsecure)
+	// 2. 使用 Signal Context 监听系统信号 (SIGINT, SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// 3. 初始化 OTel Tracing
+	shutdownTracer, err := otel.InitTracer(ctx, cfg.OtelEndpoint, cfg.OtelInsecure)
 	if err != nil {
 		log.Printf("OTel tracer init failed, tracing disabled: %v", err)
 	} else {
 		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			tCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err := shutdownTracer(shutdownCtx); err != nil {
+			if err := shutdownTracer(tCtx); err != nil {
 				log.Printf("OTel tracer shutdown error: %v", err)
 			}
 		}()
 	}
 
+	// 4. 初始化 Redis 客户端与连接回收
 	var rateLimiter middleware.RateLimiter
 	var messageBus *redisbus.MessageBus
-
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.RedisAddr,
 		Password: cfg.RedisPassword,
 		DB:       cfg.RedisDB,
 	})
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			log.Printf("Error closing Redis connection: %v", err)
+		}
+	}()
 
-	_, err = rdb.Ping(context.Background()).Result()
-	if err != nil {
+	if _, err = rdb.Ping(context.Background()).Result(); err != nil {
 		log.Printf("Redis connection failed, rate limiting disabled: %v", err)
-		rateLimiter = nil
 	} else {
 		log.Printf("Redis connected successfully")
 		rateLimiter = limiter.NewLimiter(rdb)
 		messageBus = redisbus.NewMessageBus(rdb)
+		defer func() {
+			if err := messageBus.Close(); err != nil {
+				log.Printf("Error closing message bus: %v", err)
+			}
+		}()
 		log.Println("Redis Pub/Sub message bus enabled")
 	}
 
-	// 启动 Cloudflare Tunnel（如果配置了 cloudflared 路径）
+	// 5. 启动 Cloudflare Tunnel
 	if cfg.CloudflaredPath != "" {
 		tm := tunnel.NewManager(cfg.CloudflaredPath, cfg.AppPort, ".tunnel_url")
-		if err := tm.Start(); err != nil {
+		tunnelCtx, tunnelCancel := context.WithTimeout(ctx, 15*time.Second)
+		defer tunnelCancel()
+		if err := tm.Start(tunnelCtx); err != nil {
 			log.Printf("Cloudflare Tunnel 启动失败: %v", err)
 		} else {
-			log.Println("Cloudflare Tunnel 正在启动...")
+			log.Printf("Cloudflare Tunnel 地址就绪: %s", tm.GetURL())
 			defer tm.Stop()
 		}
 	}
 
+	// 6. 初始化 MySQL 数据库与连接池回收
 	var userRepo repository.UserRepository
 	var channelRepo repository.ChannelRepository
 	var messageRepo repository.MessageRepository
@@ -91,6 +106,9 @@ func main() {
 		db, err := database.Connect(cfg.MySQLDSN, cfg.DBLogLevel)
 		if err != nil {
 			log.Fatalf("Failed to connect to MySQL: %v", err)
+		}
+		if sqlDB, err := db.DB(); err == nil {
+			defer sqlDB.Close()
 		}
 		if err := database.AutoMigrate(db, &repository.User{}, &repository.Channel{}, &repository.Message{}); err != nil {
 			log.Fatalf("Failed to auto-migrate MySQL tables: %v", err)
@@ -104,21 +122,88 @@ func main() {
 		log.Println("Using in-memory user repository (MYSQL_DSN not set)")
 	}
 
+	// 7. 初始化 WebSocket Hub
+	hub := ws.NewHub()
+	if messageBus != nil {
+		hub.SetBus(messageBus)
+	}
+
+	// 8. 路由与中间件装配
+	router := setupRouter(cfg, userRepo, channelRepo, messageRepo, hub, messageBus, rateLimiter)
+
+	srv := &http.Server{
+		Addr:    ":" + cfg.AppPort,
+		Handler: router,
+	}
+
+	// 9. 启动 HTTP 服务与优雅停机
+	eg, egCtx := errgroup.WithContext(ctx)
+
+	eg.Go(func() error {
+		log.Printf("API server starting on :%s", cfg.AppPort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("server listen failed: %w", err)
+		}
+		return nil
+	})
+
+	eg.Go(func() error {
+		<-egCtx.Done()
+		log.Println("Initiating graceful shutdown...")
+
+		// 优化停序：优先广播并断开 WebSocket 长连接
+		log.Println("Notifying and disconnecting WebSocket clients...")
+		hub.BroadcastSystemAll("服务器即将关闭维护，请稍后重新连接...")
+		time.Sleep(100 * time.Millisecond)
+		hub.Close()
+
+		// 再关闭 HTTP 服务
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		log.Println("Shutting down HTTP server...")
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("HTTP server forced shutdown: %w", err)
+		}
+		return nil
+	})
+
+	if err := eg.Wait(); err != nil {
+		log.Printf("Server exit context: %v", err)
+	}
+	log.Println("Server successfully stopped")
+}
+
+// setupRouter 抽离路由注册逻辑
+func setupRouter(
+	cfg *config.Config,
+	userRepo repository.UserRepository,
+	channelRepo repository.ChannelRepository,
+	messageRepo repository.MessageRepository,
+	hub *ws.Hub,
+	messageBus *redisbus.MessageBus,
+	rateLimiter middleware.RateLimiter,
+) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 
 	router.Use(gin.Recovery())
 	router.Use(gzip.Gzip(gzip.DefaultCompression))
 	router.Use(middleware.OtelMiddleware())
-	router.Use(middleware.LoggingMiddleware())
+	router.Use(middleware.LoggingMiddleware(cfg))
 
-	hub := ws.NewHub()
 	authHandler := handler.NewAuthHandler(cfg, userRepo, hub)
-	if messageBus != nil {
-		hub.SetBus(messageBus)
-	}
 
-	// 聊天功能（需要 MySQL）
+	// 公共接口
+	public := router.Group("/api/public")
+	public.Use(middleware.RateLimitMiddleware(rateLimiter, 20, time.Minute))
+	public.POST("/login", authHandler.Login)
+	public.POST("/register", authHandler.Register)
+	public.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "timestamp": time.Now().Unix()})
+	})
+
+	// 聊天功能 (依赖 MySQL)
 	if channelRepo != nil && messageRepo != nil {
 		chatHandler := handler.NewChatHandler(channelRepo, messageRepo, hub, messageBus)
 		hub.OnMessage = chatHandler.OnWSMessage
@@ -158,20 +243,19 @@ func main() {
 		admin.DELETE("/messages/:id", adminHandler.DeleteMessage)
 		admin.POST("/broadcast", adminHandler.Broadcast)
 
-		// 超级管理员接口（仅 super_admin 可用）
+		// 超级管理员接口
 		superAdmin := api.Group("/admin")
 		superAdmin.Use(middleware.SuperAdminMiddleware(userRepo))
 		superAdmin.POST("/set-admin", adminHandler.SetAdmin)
 		superAdmin.POST("/remove-admin", adminHandler.RemoveAdmin)
 
-		// WebSocket — token 通过第一条 auth 消息传递，避免 URL 泄露
+		// WebSocket 入口
 		router.GET("/api/ws", func(c *gin.Context) {
 			validateToken := func(token string) (string, string, error) {
 				claims, err := jwt.ValidateToken(token, cfg.JWTSecret)
 				if err != nil {
 					return "", "", err
 				}
-				// 检查用户是否被封禁
 				user, err := userRepo.GetUserByUsername(claims.Username)
 				if err != nil || user == nil {
 					return "", "", fmt.Errorf("user not found")
@@ -190,58 +274,5 @@ func main() {
 		})
 	}
 
-	public := router.Group("/api/public")
-	public.Use(middleware.RateLimitMiddleware(rateLimiter, 20, time.Minute))
-	public.POST("/login", authHandler.Login)
-	public.POST("/register", authHandler.Register)
-	public.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "timestamp": time.Now().Unix()})
-	})
-
-	srv := &http.Server{
-		Addr:    ":" + cfg.AppPort,
-		Handler: router,
-	}
-
-	eg, ctx := errgroup.WithContext(context.Background())
-
-	eg.Go(func() error {
-		log.Printf("API server starting on :%s", cfg.AppPort)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			return fmt.Errorf("server listen failed: %w", err)
-		}
-		return nil
-	})
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	eg.Go(func() error {
-		select {
-		case <-quit:
-			log.Println("Received shutdown signal")
-		case <-ctx.Done():
-			log.Println("Context cancelled")
-		}
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		log.Println("Shutting down API server...")
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("server shutdown failed: %w", err)
-		}
-		log.Println("Notifying WebSocket clients before shutdown...")
-		hub.BroadcastSystemAll("服务器即将关闭，请稍后重新连接")
-		time.Sleep(100 * time.Millisecond)
-		log.Println("Closing WebSocket hub...")
-		hub.Close()
-		return nil
-	})
-
-	if err := eg.Wait(); err != nil {
-		log.Fatalf("Server error: %v", err)
-	}
-
-	log.Println("Server exiting")
+	return router
 }
